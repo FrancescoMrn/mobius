@@ -1,10 +1,10 @@
 /* Pure lifecycle projection for chat-owned edits and their contributions. */
 
-export const CHANGE_STAGES = ['unsorted', 'prepared', 'open', 'landed']
+export const CHANGE_STAGES = ['unsorted', 'prepared', 'open', 'settled']
 
 const PREPARED = new Set(['prepared', 'submitting'])
 const OPEN = new Set(['draft', 'open', 'landing'])
-const LANDED = new Set(['merged', 'superseded', 'closed'])
+const SETTLED = new Set(['merged', 'superseded', 'closed'])
 
 function cleanPath(value) {
   if (typeof value !== 'string') return ''
@@ -27,7 +27,7 @@ function fallbackSourceRoot(record) {
 export function contributionStage(record) {
   if (PREPARED.has(record?.status)) return 'prepared'
   if (OPEN.has(record?.status)) return 'open'
-  if (LANDED.has(record?.status)) return 'landed'
+  if (SETTLED.has(record?.status)) return 'settled'
   return null
 }
 
@@ -49,6 +49,76 @@ function entryPaths(entry) {
   return (entry?.preview?.files || [])
     .map(file => cleanPath(file?.path))
     .filter(Boolean)
+}
+
+function isTrackableSourcePath(value) {
+  const path = cleanPath(value)
+  if (!path || path === '/tmp' || path.startsWith('/tmp/')) return false
+  if (
+    path === '/data/contrib' || path.startsWith('/data/contrib/')
+    || path === '/data/agent-scratch' || path.startsWith('/data/agent-scratch/')
+    || path === '/data/chats' || path.startsWith('/data/chats/')
+    || path === '/data/shared' || path.startsWith('/data/shared/')
+    || path === '/data/db' || path.startsWith('/data/db/')
+    || path === '/data/cli-auth' || path.startsWith('/data/cli-auth/')
+    || /^\/data\/apps\/\d+(?:\/|$)/.test(path)
+  ) return false
+  return true
+}
+
+function trackableEntry(entry) {
+  const files = (entry?.preview?.files || []).filter(
+    file => isTrackableSourcePath(file?.path),
+  )
+  return files.length ? { ...entry, preview: { ...entry.preview, files } } : null
+}
+
+function instant(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  const parsed = Date.parse(String(value || ''))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function recordCoversEntry(record, entry) {
+  const coveredAt = instant(record?.coverage_at)
+  const editedAt = instant(entry?.ts)
+  // Old projections and old transcript entries have no ordering signal. Keep
+  // their prior conservative path coverage; every new projection is temporal.
+  return coveredAt === null || editedAt === null || editedAt <= coveredAt
+}
+
+function settlementCoversEntry(settlement, entry) {
+  const coveredAt = instant(settlement?.coverage_at)
+  const editedAt = instant(entry?.ts)
+  return coveredAt !== null && (editedAt === null || editedAt <= coveredAt)
+}
+
+export function changeSource(path) {
+  const clean = cleanPath(path)
+  const app = clean.match(/^\/data\/apps\/([^/]+)(?:\/|$)/)
+  if (app) return {
+    id: `/data/apps/${app[1]}`,
+    label: app[1].split('-').filter(Boolean)
+      .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' '),
+  }
+  if (clean === '/data/platform' || clean.startsWith('/data/platform/')) {
+    return { id: '/data/platform', label: 'Möbius' }
+  }
+  const parts = clean.split('/').filter(Boolean)
+  const id = clean.startsWith('/') ? `/${parts.slice(0, 2).join('/')}` : parts[0] || 'other'
+  return { id, label: parts.at(-2) || parts[0] || 'Other project' }
+}
+
+export function groupUnsortedFiles(files) {
+  const groups = new Map()
+  for (const file of Array.isArray(files) ? files : []) {
+    const source = changeSource(file?.path)
+    const group = groups.get(source.id) || { ...source, files: [] }
+    group.files.push(file)
+    groups.set(source.id, group)
+  }
+  return [...groups.values()].sort((left, right) => left.label.localeCompare(right.label))
 }
 
 function combinedFileStatus(previous, next) {
@@ -87,34 +157,56 @@ function combineFiles(entries, allowedPaths) {
 }
 
 export function chatChangesOverview(entries, payload) {
-  const safeEntries = Array.isArray(entries) ? entries : []
+  const safeEntries = (Array.isArray(entries) ? entries : [])
+    .map(trackableEntry)
+    .filter(Boolean)
   const records = Array.isArray(payload?.records) ? payload.records : []
+  const settlements = Array.isArray(payload?.settlements) ? payload.settlements : []
   const paths = new Set(safeEntries.flatMap(entryPaths))
-  const covered = new Set()
-  for (const record of records) {
-    for (const file of record?.files || []) {
-      const path = contributionSourceFile(record, file)
-      if (path) covered.add(path)
+  const coveredForEntry = new Map()
+  for (const entry of safeEntries) {
+    const covered = new Set()
+    for (const record of records) {
+      if (!recordCoversEntry(record, entry)) continue
+      for (const file of record?.files || []) {
+        const path = contributionSourceFile(record, file)
+        if (path) covered.add(path)
+      }
     }
+    for (const settlement of settlements) {
+      const path = cleanPath(settlement?.path)
+      if (path && settlementCoversEntry(settlement, entry)) covered.add(path)
+    }
+    coveredForEntry.set(entry, covered)
   }
-
-  const unsortedPaths = [...paths].filter(path => !covered.has(path)).sort()
-  const unsortedSet = new Set(unsortedPaths)
   const unsortedEntries = safeEntries.flatMap(entry => {
+    const covered = coveredForEntry.get(entry) || new Set()
     const files = (entry?.preview?.files || []).filter(
-      file => unsortedSet.has(cleanPath(file?.path)),
+      file => !covered.has(cleanPath(file?.path)),
     )
     return files.length ? [{
       ...entry,
       preview: { ...entry.preview, files },
     }] : []
   })
+  const unsortedPaths = [...new Set(unsortedEntries.flatMap(entryPaths))].sort()
+  const unsortedSet = new Set(unsortedPaths)
   const unsortedFiles = combineFiles(unsortedEntries, unsortedSet)
 
-  const stages = { prepared: [], open: [], landed: [] }
+  const stages = { prepared: [], open: [], settled: [] }
   for (const record of records) {
     const stage = contributionStage(record)
     if (stage) stages[stage].push(record)
+  }
+  for (const settlement of settlements) {
+    const path = cleanPath(settlement?.path)
+    if (!path || !paths.has(path)) continue
+    stages.settled.push({
+      ...settlement,
+      kind: 'local',
+      path,
+      status: 'local',
+    })
   }
   for (const stage of Object.values(stages)) {
     stage.sort((left, right) => String(right?.updated_at || '')
@@ -126,7 +218,7 @@ export function chatChangesOverview(entries, payload) {
     unsorted: unsortedPaths.length,
     prepared: stages.prepared.length,
     open: stages.open.length,
-    landed: stages.landed.length,
+    settled: stages.settled.length,
     attention,
     files: paths.size,
     updates: safeEntries.length,
@@ -140,6 +232,14 @@ export function chatChangesOverview(entries, payload) {
     counts,
     hasWork: counts.files > 0 || records.length > 0,
     needsAction: counts.unsorted > 0 || counts.prepared > 0 || attention > 0,
+    workflowRevision: [
+      unsortedEntries
+        .map(entry => `${entry.id}:${entryPaths(entry).join(',')}`)
+        .sort()
+        .join('|'),
+      ...records.map(record => `${record.id}:${record.action_key || record.status || ''}`)
+        .sort(),
+    ].join('||'),
     unsortedRevision: unsortedEntries
       .map(entry => `${entry.id}:${entryPaths(entry).join(',')}`)
       .sort()
@@ -155,7 +255,7 @@ export function compactChangesSummary(overview) {
   if (counts.open > 0) parts.push(`${counts.open} open`)
   if (counts.attention > 0) parts.push(`${counts.attention} need attention`)
   if (parts.length > 0) return parts.join(' · ')
-  if (counts.landed > 0) return `${counts.landed} landed · everything settled`
+  if (counts.settled > 0) return `${counts.settled} settled · everything organized`
   return 'No changes from this chat yet'
 }
 
@@ -164,7 +264,7 @@ export function initialChangesStage(overview) {
   if (counts.unsorted > 0) return 'unsorted'
   if (counts.prepared > 0) return 'prepared'
   if (counts.open > 0) return 'open'
-  if (counts.landed > 0) return 'landed'
+  if (counts.settled > 0) return 'settled'
   return 'unsorted'
 }
 

@@ -6,6 +6,7 @@ import {
   contributionNeedsAttention,
   contributionSourceFile,
   contributionStage,
+  groupUnsortedFiles,
   initialChangesStage,
   isUnsortedDismissed,
   rememberUnsortedDismissed,
@@ -30,7 +31,7 @@ function fakeStorage() {
   }
 }
 
-test('one lifecycle separates recorded edits from prepared, open, and landed work', () => {
+test('one lifecycle separates recorded edits from prepared, open, and settled work', () => {
   const overview = chatChangesOverview([
     entry('one', '/data/platform/a.js', '/data/platform/b.js'),
     entry('two', '/data/apps/demo/index.jsx'),
@@ -44,7 +45,7 @@ test('one lifecycle separates recorded edits from prepared, open, and landed wor
       files: ['index.jsx'], updated_at: '2026-08-27T11:00:00Z',
     },
     {
-      id: 'landed', status: 'merged', source_root: '/data/platform',
+      id: 'settled', status: 'merged', source_root: '/data/platform',
       files: ['old.js'], updated_at: '2026-08-27T09:00:00Z',
     },
   ] })
@@ -56,7 +57,7 @@ test('one lifecycle separates recorded edits from prepared, open, and landed wor
     [['/data/platform/b.js']],
   )
   assert.deepEqual(overview.counts, {
-    unsorted: 1, prepared: 1, open: 1, landed: 1,
+    unsorted: 1, prepared: 1, open: 1, settled: 1,
     attention: 0, files: 3, updates: 2,
   })
   assert.equal(compactChangesSummary(overview), '1 unsorted · 1 prepared · 1 open')
@@ -107,7 +108,7 @@ test('coverage uses the exact source root and retains a Möbius fallback for old
 test('status and attention semantics stay independent', () => {
   assert.equal(contributionStage({ status: 'submitting' }), 'prepared')
   assert.equal(contributionStage({ status: 'landing' }), 'open')
-  assert.equal(contributionStage({ status: 'closed' }), 'landed')
+  assert.equal(contributionStage({ status: 'closed' }), 'settled')
   assert.equal(contributionStage({ status: 'abandoned' }), null)
   assert.equal(contributionNeedsAttention({ status: 'open' }), false)
   assert.equal(contributionNeedsAttention({ needs_attention: true }), true)
@@ -116,12 +117,60 @@ test('status and attention semantics stay independent', () => {
 })
 
 test('Brain copy stays quiet when settled and names only useful outstanding work', () => {
-  assert.equal(compactChangesSummary({ counts: { landed: 3 } }), '3 landed · everything settled')
+  assert.equal(compactChangesSummary({ counts: { settled: 3 } }), '3 settled · everything organized')
   assert.equal(compactChangesSummary({ counts: {} }), 'No changes from this chat yet')
   assert.equal(
     compactChangesSummary({ counts: { unsorted: 2, prepared: 1, open: 4, attention: 1 } }),
     '2 unsorted · 1 prepared · 4 open · 1 need attention',
   )
+})
+
+test('an edit made after an old contribution returns to unsorted', () => {
+  const older = entry('older', '/data/platform/same.js')
+  older.ts = Date.parse('2026-08-27T10:00:00Z')
+  const newer = entry('newer', '/data/platform/same.js')
+  newer.ts = Date.parse('2026-08-27T12:00:00Z')
+
+  const overview = chatChangesOverview([older, newer], { records: [{
+    id: 'old-pr', status: 'open', source_root: '/data/platform', files: ['same.js'],
+    coverage_at: '2026-08-27T11:00:00Z',
+  }] })
+
+  assert.deepEqual(overview.unsortedEntries.map(item => item.id), ['newer'])
+  assert.deepEqual(overview.unsortedPaths, ['/data/platform/same.js'])
+})
+
+test('a local settlement hides only edits through the reviewed instant', () => {
+  const older = entry('older', '/data/platform/local.js')
+  older.ts = Date.parse('2026-08-27T10:00:00Z')
+  const newer = entry('newer', '/data/platform/local.js')
+  newer.ts = Date.parse('2026-08-27T12:00:00Z')
+
+  const overview = chatChangesOverview([older, newer], {
+    records: [],
+    settlements: [{
+      id: 'local:a', kind: 'local', path: '/data/platform/local.js',
+      disposition: 'experimental', summary: 'Kept as a local experiment.',
+      coverage_at: '2026-08-27T11:00:00Z', updated_at: '2026-08-27T11:01:00Z',
+    }],
+  })
+
+  assert.deepEqual(overview.unsortedEntries.map(item => item.id), ['newer'])
+  assert.deepEqual(overview.unsortedPaths, ['/data/platform/local.js'])
+  assert.equal(overview.counts.settled, 1)
+  assert.equal(overview.stages.settled[0].kind, 'local')
+  assert.equal(overview.stages.settled[0].status, 'local')
+})
+
+test('unsorted files group by owning project for individual preparation', () => {
+  assert.deepEqual(groupUnsortedFiles([
+    { path: '/data/apps/notes/index.jsx' },
+    { path: '/data/platform/frontend/a.jsx' },
+    { path: '/data/apps/notes/theme.js' },
+  ]).map(group => [group.id, group.files.length]), [
+    ['/data/platform', 1],
+    ['/data/apps/notes', 2],
+  ])
 })
 
 test('dismissing the preparation suggestion hides one revision, not future edits', () => {
@@ -132,4 +181,17 @@ test('dismissing the preparation suggestion hides one revision, not future edits
   assert.equal(rememberUnsortedDismissed('chat-a', revision, storage), true)
   assert.equal(isUnsortedDismissed('chat-a', revision, storage), true)
   assert.equal(isUnsortedDismissed('chat-a', `${revision}|edit-2`, storage), false)
+})
+
+test('temporary review worktrees and runtime storage never become contribution work', () => {
+  const overview = chatChangesOverview([
+    entry('source', '/data/platform/frontend/a.jsx'),
+    entry('tmp', '/tmp/contrib-review/app/a.jsx'),
+    entry('review', '/data/contrib/private-review/worktree/a.jsx'),
+    entry('app-data', '/data/apps/80/settings.json'),
+  ], { records: [] })
+
+  assert.deepEqual(overview.unsortedPaths, ['/data/platform/frontend/a.jsx'])
+  assert.equal(overview.counts.files, 1)
+  assert.equal(overview.counts.updates, 1)
 })

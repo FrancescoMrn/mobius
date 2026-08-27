@@ -23,6 +23,10 @@ import {
   isHorizontalSwipe,
   passedDismissThreshold,
   publicationAction,
+  publicationFailureOwner,
+  publicationItemsAction,
+  publicationStackAction,
+  reviewActionKey,
   rememberDismissed,
   rememberReviewItemDismissed,
   reviewDestinationLabel,
@@ -31,6 +35,7 @@ import {
   reviewGroupDefault,
   reviewPanelSummary,
   sendBlocker,
+  stackSendBlocker,
   statusLabel,
   submitFailure,
   trackingNarration,
@@ -40,6 +45,7 @@ import {
 } from '../contributionReviewModel.js'
 
 const cardSrc = readFileSync(new URL('../ContributionReviewCard.jsx', import.meta.url), 'utf8')
+const publicationSrc = readFileSync(new URL('../chatContributionPublication.js', import.meta.url), 'utf8')
 const clientSrc = readFileSync(new URL('../../../api/client.js', import.meta.url), 'utf8')
 const cardCss = readFileSync(new URL('../ContributionReviewCard.css', import.meta.url), 'utf8')
 const chatViewSrc = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
@@ -184,11 +190,9 @@ test('direct send requires the exact reviewed happy path', () => {
 
   assert.deepEqual(publicationAction(ready), {
     label: 'Send PR', busyLabel: 'Sending PR',
-    progress: 'Opening the reviewed pull request…',
   })
   assert.deepEqual(publicationAction({ ...ready, action: 'pr_update' }), {
     label: 'Update PR', busyLabel: 'Updating PR',
-    progress: 'Updating the reviewed pull request…',
   })
   assert.equal(autopilotOnSend({ autopilot_available: true }), true)
   assert.equal(autopilotOnSend({ autopilot_available: true, autopilot_default: false }), false)
@@ -217,14 +221,13 @@ test('failed publication becomes a calm recovery action, not another blind send'
   assert.equal(recovery.scope, 'contribute-review:b0661670f342e064')
   assert.equal(recovery.scopeLabel, 'Fix and review contribution')
   assert.equal(recovery.draft, contributionRecoveryDraft(record))
-  assert.match(cardSrc, /: 'Fix and review'\}/)
-  assert.match(cardSrc, />\s*Review in Contribute\s*</)
-  assert.match(cardSrc, /<summary>Technical details<\/summary>/)
-  assert.doesNotMatch(cardSrc, /<summary>What blocked it<\/summary>/)
+  assert.match(cardSrc, />\s*Fix and review\s*</)
+  assert.match(cardSrc, />\s*Details\s*</)
+  assert.doesNotMatch(cardSrc, /contrib-card__progress/)
   assert.doesNotMatch(chatViewSrc, /handleContributionRecovery|onFixContribution/)
   assert.match(cardSrc, /api\.appChats\.startWithToken\(appToken/)
-  assert.match(cardSrc, /'Review in progress'/)
-  assert.match(cardSrc, /'Open review conversation'/)
+  assert.match(cardSrc, /async function fixItem/)
+  assert.match(cardSrc, /const started = await startRecovery\(record\)/)
   assert.match(cardSrc, /onOpenApp\(contributeApp, \{ final: true, intent \}\)[\s\S]*onDismiss\(\)/)
 })
 
@@ -270,8 +273,71 @@ test('stack layers collapse into one ordered review item and one exact doorway',
 
   assert.match(cardSrc, /item\.kind === 'stack'/)
   assert.match(cardSrc, /<StackReviewRow/)
-  assert.match(cardSrc, /Review stack in Contribute/)
+  assert.match(cardSrc, /Fix and review stack/)
+  assert.match(cardSrc, /action\.label/)
   assert.doesNotMatch(cardSrc, />Layers</)
+})
+
+test('a complete stack from another source chat becomes one direct approval', () => {
+  const layer = (id, position) => ({
+    id, status: 'prepared', action: 'pr', quality_review_ready: true,
+    review: { state: 'ready' }, repo: PLATFORM_REPO,
+    stack: { id: 'approval', name: 'Direct approval', position, total: 2 },
+  })
+  const first = layer('first', 1)
+  const second = layer('second', 2)
+  const items = reviewItems({
+    records: [second],
+    stack_units: [{
+      id: 'approval', name: 'Direct approval', repo: PLATFORM_REPO,
+      records: [first, second],
+    }],
+  })
+  assert.equal(items.length, 1)
+  assert.deepEqual(items[0].records.map(record => record.id), ['first', 'second'])
+  assert.equal(stackSendBlocker(items[0], { connected: true }), null)
+  assert.deepEqual(publicationStackAction(items[0]), {
+    label: 'Send stack', confirmLabel: 'Send PRs', count: 2, updating: false,
+  })
+  assert.match(stackSendBlocker({
+    ...items[0], records: [second],
+  }, { connected: true }), /complete linked set/)
+
+  const partial = reviewItems({
+    records: [{ ...first, status: 'draft' }],
+    stack_units: [{
+      id: 'approval', name: 'Direct approval', repo: PLATFORM_REPO,
+      records: [{ ...first, status: 'draft', review: null }, second],
+    }],
+  })
+  assert.equal(partial.length, 1)
+  assert.equal(stackSendBlocker(partial[0], { connected: true }), null)
+  assert.equal(publicationStackAction(partial[0]).count, 1)
+})
+
+test('confirmation copy counts exact pull requests rather than stack containers', () => {
+  const stack = (id, action = 'pr') => ({
+    kind: 'stack',
+    id,
+    records: [1, 2].map(position => ({
+      id: `${id}-${position}`,
+      status: 'prepared',
+      action,
+    })),
+  })
+
+  assert.deepEqual(publicationItemsAction([stack('one'), stack('two')]), {
+    count: 4,
+    updating: false,
+    promptLabel: 'Send 4 reviewed pull requests?',
+    confirmLabel: 'Send 4 PRs',
+  })
+  assert.deepEqual(publicationItemsAction([stack('one', 'pr_update')]), {
+    count: 2,
+    updating: true,
+    promptLabel: 'Update 2 reviewed pull requests?',
+    confirmLabel: 'Update 2 PRs',
+  })
 })
 
 test('loaded older backends group canonical stack branches during hot reload', () => {
@@ -320,22 +386,39 @@ test('grouped cards expose one safe default for the exact visible set', () => {
     },
   })
   assert.deepEqual(reviewGroupDefault([ready('one'), ready('two')], { connected: true }), {
-    kind: 'publish',
-    records: [ready('one').record, ready('two').record],
+    kind: 'publish-items',
+    items: [ready('one'), ready('two')],
     label: 'Send all 2',
-    busyLabel: 'Sending 0 of 2',
   })
   assert.deepEqual(reviewGroupDefault([
     ready('one'),
     { kind: 'stack', id: 'stack:demo', records: [{ id: 'layer' }] },
   ], { connected: true }), {
-    kind: 'review', intent: 'reviews:queue', label: 'Review all 2',
+    kind: 'review', intent: 'reviews:queue', label: 'Fix and review all 2',
   })
-  assert.equal(reviewGroupDefault([
+  assert.deepEqual(reviewGroupDefault([
     ready('one'),
     { kind: 'record', id: 'sent', record: { id: 'sent', status: 'open' } },
-  ], { connected: true }), null)
+  ], { connected: true }), { kind: 'contribute', label: 'Handle all' })
+  assert.deepEqual(reviewGroupDefault([
+    { kind: 'unsorted', id: 'unsorted:x' }, ready('one'),
+  ], { connected: true }), { kind: 'contribute', label: 'Handle all' })
   assert.equal(reviewGroupDefault([ready('one')], { connected: true }), null)
+})
+
+test('public failures distinguish agent recovery from owner account work', () => {
+  assert.equal(publicationFailureOwner({ status: 403, code: 'forbidden' }), 'owner')
+  assert.equal(publicationFailureOwner({ status: 0, code: 'unconfirmed_result' }), 'agent')
+  assert.equal(publicationFailureOwner({ status: 409, code: 'review_refresh_needed' }), 'agent')
+  assert.equal(reviewActionKey({ id: 'one', updated_at: 'T1', status: 'prepared' }), 'one:T1:prepared')
+  assert.equal(
+    reviewActionKey({ id: 'one', action_key: 'stable', updated_at: 'T2', status: 'open' }),
+    'one:stable',
+  )
+  assert.equal(
+    reviewActionKey({ id: 'one', updated_at: 'T1', status: 'open', needs_attention: true }),
+    reviewActionKey({ id: 'one', updated_at: 'T2', status: 'open', needs_attention: true }),
+  )
 })
 
 test('healthy sent records leave chat while attention can hand work back to the agent', () => {
@@ -348,20 +431,22 @@ test('healthy sent records leave chat while attention can hand work back to the 
   assert.match(cardSrc, /trackingStatusLabel\(record\)/)
   assert.match(cardSrc, /trackingNarration\(record\)/)
   assert.match(cardSrc, /onContinueInChat\(record\)/)
-  assert.match(cardSrc, /'Ask agent to fix'/)
-  assert.match(chatViewSrc, /doSend\(contributionFollowupPrompt\(record\), \{/)
+  assert.match(cardSrc, />\s*Ask agent to fix\s*</)
+  assert.doesNotMatch(cardSrc, /Queue agent follow-up/)
+  assert.match(cardSrc, /acceptedRef\.current\.has\(key\)/)
+  assert.match(chatViewSrc, /sendContributionIntent\(`followup:\$\{reviewActionKey\(record\)\}`/)
   assert.match(chatViewSrc, /onContinueInChat=\{handleContributionFollowup\}/)
-  assert.match(cardSrc, /publication\?\.record\?\.status === 'draft'/)
+  assert.match(publicationSrc, /publication\?\.record\?\.status === 'draft'/)
 })
 test('chat cards keep direct send and exact review on the same guarded routes', () => {
   assert.match(clientSrc, /submitter:\s*'chat-review-card'/)
   assert.match(clientSrc, /record\?\.action === 'pr_update'/)
   assert.match(clientSrc, /update-existing/)
-  assert.match(cardSrc, /api\.contributions\.publish\(appId, record/)
-  assert.match(cardSrc, /const busy = sending \|\| submitting/)
-  assert.match(cardSrc, /\) : busy \? \(/)
-  assert.match(cardSrc, /aria-busy="true"[\s\S]*\{action\.busyLabel\}/)
-  assert.doesNotMatch(cardSrc, /!blocker && !submitting/)
+  assert.match(publicationSrc, /publish = api\.contributions\.publish/)
+  assert.match(cardSrc, /consume\(item\)[\s\S]*const outcome = await publishContribution\(\{/)
+  assert.match(cardSrc, /publicationFailureOwner\(outcome\.failure\) === 'agent'/)
+  assert.match(cardSrc, /const started = await startRecovery/)
+  assert.doesNotMatch(cardSrc, /contrib-card__progress/)
   assert.match(cardSrc, />\s*Review\s*</)
   assert.doesNotMatch(cardSrc, /body_draft|record\.files|The exact text that will be published/)
   assert.doesNotMatch(cardSrc, /Contribute this improvement|>Details<|>Layers</)

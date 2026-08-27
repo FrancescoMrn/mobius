@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useEffect, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { X } from '@openai/apps-sdk-ui/components/Icon'
 import { api } from '../../api/client.js'
 import { appQueries } from '../../hooks/queries.js'
@@ -7,135 +7,243 @@ import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.
 import {
   autopilotOnSend,
   contributionRecoveryAction,
-  contributionReviewRunPhase,
   contributionReviewIntent,
   diffStatSummary,
   isTrackingRecord,
   isHorizontalSwipe,
   passedDismissThreshold,
   publicationAction,
+  publicationFailureOwner,
+  publicationItemsAction,
+  publicationStackAction,
   rememberReviewItemDismissed,
-  reviewDestinationLabel,
+  reviewActionKey,
   reviewItemIntent,
+  reviewGroupDefault,
   reviewPanelSummary,
   sendBlocker,
+  stackSendBlocker,
   statusLabel,
-  submitFailure,
   trackingNarration,
   trackingStatusLabel,
   visibleReviewItems,
 } from './contributionReviewModel.js'
 import {
-  chatChangesOverview,
   isUnsortedDismissed,
   rememberUnsortedDismissed,
 } from './chatChangesLifecycle.js'
-import { useChatContributions } from './useChatChangesOverview.js'
+import { useChatChangesOverview } from './useChatChangesOverview.js'
+import {
+  projectPublishedContribution,
+  publishContribution,
+  publishContributionStack,
+} from './chatContributionPublication.js'
 import './ContributionReviewCard.css'
+
+function itemRevision(item) {
+  if (item?.kind === 'unsorted') return item.id
+  if (item?.kind === 'record') {
+    return reviewActionKey(item.record)
+  }
+  return `${item?.id || ''}:${(item?.records || [])
+    .map(record => reviewActionKey(record))
+    .join('|')}`
+}
 
 export default function ContributionReviewCard({
   chatId,
   turnActive,
   initialChangeEntries = [],
   onOpenApp,
-  onOpenChat,
   onContinueInChat,
   onOpenChanges,
   onPrepareChanges,
+  onContributeAll,
 }) {
   const queryClient = useQueryClient()
-  const contributionQuery = useChatContributions(chatId)
+  const overview = useChatChangesOverview(chatId, initialChangeEntries)
   const {
-    appId,
-    app: contributeApp,
-    data,
-    queryKey,
-  } = contributionQuery
+    contributeAppId: appId,
+    contributeApp,
+    contributions: data,
+    contributionsQuery,
+  } = overview
+  const queryKey = contributionsQuery.queryKey
   const { data: appToken } = appQueries.token.useQuery(appId)
+  const [dismissRevision, setDismissRevision] = useState(0)
+  const [accepted, setAccepted] = useState(() => new Set())
+  const acceptedRef = useRef(new Set())
+  const [actionFailures, setActionFailures] = useState({})
+  const [confirmingItems, setConfirmingItems] = useState(null)
+  const storage = typeof localStorage !== 'undefined' ? localStorage : null
 
-  // The agent stages a review during a turn, so refetch exactly once when a turn
-  // SETTLES — not on every render and not on a timer. Nothing else can add a
-  // record for this chat behind the owner's back.
   const wasActive = useRef(turnActive)
   useEffect(() => {
     if (wasActive.current && !turnActive) {
-      queryClient.invalidateQueries({ queryKey, exact: true })
+      void queryClient.invalidateQueries({ queryKey, exact: true }).finally(() => {
+        acceptedRef.current = new Set()
+        setAccepted(new Set())
+      })
     }
     wasActive.current = turnActive
   }, [turnActive, queryClient, queryKey])
 
-  // Dismissals are persisted, so this only forces the re-render; the stored
-  // decision is what actually filters the list.
-  const [dismissRevision, setDismissRevision] = useState(0)
-
-  const storage = typeof localStorage !== 'undefined' ? localStorage : null
-  const overview = useMemo(
-    () => chatChangesOverview(initialChangeEntries, data),
-    [initialChangeEntries, data],
-  )
+  const unsortedItem = {
+    kind: 'unsorted',
+    id: `unsorted:${overview.unsortedRevision}`,
+  }
   const unsortedVisible = !turnActive
     && overview.counts.unsorted > 0
     && !isUnsortedDismissed(chatId, overview.unsortedRevision, storage)
-  const pendingItems = [
-    ...(unsortedVisible ? [{ kind: 'unsorted', id: `unsorted:${overview.unsortedRevision}` }] : []),
+  const allItems = [
+    ...(unsortedVisible ? [unsortedItem] : []),
     ...visibleReviewItems(data, storage),
   ]
+  const pendingItems = allItems.filter(item => !accepted.has(itemRevision(item)))
   const panel = reviewPanelSummary(pendingItems)
   const grouped = panel.count > 1
+  const groupDefault = reviewGroupDefault(pendingItems, {
+    connected: data?.connected !== false,
+  })
   void dismissRevision
-  if (!appId) return null
-  if (panel.count === 0) return null
+  if (!appId || panel.count === 0) return null
 
-  async function publish(record) {
-    try {
-      const response = await api.contributions.publish(appId, record, {
-        autopilot: autopilotOnSend(data),
-      })
-      const body = await response.json().catch(() => null)
-      if (!response.ok) {
-        const detail = body?.detail
-        const message = typeof detail === 'string' ? detail : detail?.message
-        return {
-          failure: {
-            message: typeof message === 'string' && message
-              ? message
-              : 'Could not send this pull request. Open Contribute for details.',
-            detail: typeof detail?.detail === 'string' ? detail.detail : '',
-          },
-        }
-      }
-      return { published: true, publication: body }
-    } catch {
-      return {
-        failure: {
-          message: 'Could not reach the server. Nothing was sent.',
-          detail: '',
-        },
-      }
-    } finally {
-      queryClient.invalidateQueries({ queryKey, exact: true })
+  function consume(item) {
+    const key = itemRevision(item)
+    if (!key || acceptedRef.current.has(key)) return false
+    acceptedRef.current.add(key)
+    setAccepted(new Set(acceptedRef.current))
+    return true
+  }
+
+  function release(item, failure) {
+    const key = itemRevision(item)
+    acceptedRef.current.delete(key)
+    setAccepted(new Set(acceptedRef.current))
+    const failureKey = item?.record?.id || item?.id
+    if (failureKey && failure) {
+      setActionFailures(current => ({ ...current, [failureKey]: failure }))
     }
   }
 
-  function rememberPublished(recordId, publication = null) {
-    const publishedStatus = publication?.record?.status === 'draft' ? 'draft' : 'open'
-    queryClient.setQueryData(queryKey, current => {
-      if (!current || !Array.isArray(current.records)) return current
-      return {
-        ...current,
-        records: current.records.map(record => (
-          record.id === recordId
-            ? {
-                ...record,
-                status: publishedStatus,
-                number: publication?.number ?? record.number,
-                url: publication?.url ?? record.url,
-                needs_attention: false,
-              }
-            : record
-        )),
-      }
+  async function startRecovery(record) {
+    const recovery = contributionRecoveryAction(record)
+    if (!appToken || !recovery) return false
+    let timezone = 'UTC'
+    try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' } catch {}
+    try {
+      const response = await api.appChats.startWithToken(appToken, {
+        title: recovery.title,
+        scope: recovery.scope,
+        scope_label: recovery.scopeLabel,
+        owner_visible: true,
+        content: recovery.draft,
+        cid: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `cid-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        timezone,
+      })
+      const body = await response.json().catch(() => null)
+      return response.ok && Boolean(body?.chat_id)
+    } catch {
+      return false
+    }
+  }
+
+  async function publishItem(item) {
+    const record = item.record
+    if (!record) return
+    if (!consume(item)) return
+    setActionFailures(current => ({ ...current, [record.id]: null }))
+    const outcome = await publishContribution({
+      appId,
+      record,
+      autopilot: autopilotOnSend(data),
+      refetch: contributionsQuery.refetch,
     })
+    if (outcome.kind === 'published') {
+      queryClient.setQueryData(queryKey, current => (
+        projectPublishedContribution(current, record.id, outcome.publication)
+      ))
+      return
+    }
+    if (outcome.kind === 'reconciled') return
+
+    if (publicationFailureOwner(outcome.failure) === 'agent') {
+      const started = await startRecovery(outcome.record)
+      if (started) return
+    }
+    release(item, outcome.failure)
+  }
+
+  async function fixItem(item) {
+    const record = item.record
+    if (!record) return
+    if (!consume(item)) return
+    const started = await startRecovery(record)
+    if (!started) {
+      release(item, {
+        message: 'The review agent could not start. Try again or open the details.',
+      })
+    }
+  }
+
+  async function publishStackItem(item) {
+    if (!consume(item)) return
+    setActionFailures(current => ({ ...current, [item.id]: null }))
+    const outcome = await publishContributionStack({
+      appId,
+      item,
+      refetch: contributionsQuery.refetch,
+    })
+    if (outcome.kind === 'published' || outcome.kind === 'reconciled') return
+    if (publicationFailureOwner(outcome.failure) === 'agent'
+      && typeof onContributeAll === 'function') {
+      onContributeAll(overview.workflowRevision)
+      return
+    }
+    release(item, outcome.failure)
+  }
+
+  async function publishConfirmedItems() {
+    const snapshot = Array.isArray(confirmingItems) ? confirmingItems : []
+    setConfirmingItems(null)
+    for (const item of snapshot) {
+      if (item.kind === 'stack') await publishStackItem(item)
+      else await publishItem(item)
+    }
+  }
+
+  function acceptPrivate(item, callback) {
+    if (typeof callback !== 'function') return
+    if (!consume(item)) return
+    callback()
+  }
+
+  async function runGroupDefault() {
+    if (!groupDefault) return
+    if (groupDefault.kind === 'contribute') {
+      if (typeof onContributeAll !== 'function') return
+      const direct = pendingItems.filter(item => (
+        item.kind === 'record'
+        && item.record?.status === 'prepared'
+        && !sendBlocker(item.record, { connected: data?.connected !== false })
+      ))
+      const agent = pendingItems.filter(item => !direct.includes(item))
+      await Promise.all(direct.map(publishItem))
+      const claimed = agent.filter(consume)
+      if (claimed.length > 0) onContributeAll(overview.workflowRevision)
+      return
+    }
+    if (groupDefault.kind === 'review') {
+      if (typeof onContributeAll !== 'function') return
+      const claimed = pendingItems.filter(consume)
+      if (claimed.length > 0) onContributeAll(overview.workflowRevision)
+      return
+    }
+    if (groupDefault.kind === 'publish-items') {
+      setConfirmingItems(groupDefault.items)
+    }
   }
 
   return (
@@ -144,27 +252,32 @@ export default function ContributionReviewCard({
       role={grouped ? 'region' : undefined}
       aria-label={grouped ? panel.title : undefined}
     >
-      {grouped && (
+      {grouped ? (
         <div className="contrib-card-stack__heading">
           <div>
-            <div className="contrib-card-stack__title">
-              {panel.title}
-            </div>
-            <div className="contrib-card-stack__copy">
-              {panel.copy}
-            </div>
+            <div className="contrib-card-stack__title">{panel.title}</div>
+            <div className="contrib-card-stack__copy">{panel.copy}</div>
           </div>
+          {groupDefault ? (
+            <button
+              type="button"
+              className="contrib-card-stack__default"
+              onClick={runGroupDefault}
+            >
+              {groupDefault.label}
+            </button>
+          ) : null}
         </div>
-      )}
+      ) : null}
       {pendingItems.map(item => {
         if (item.kind === 'unsorted') {
           return (
             <UnsortedChangesRow
-              key={item.id}
+              key={itemRevision(item)}
               fileCount={overview.counts.unsorted}
               updateCount={overview.unsortedEntries.length}
               onOpenChanges={onOpenChanges}
-              onPrepareChanges={onPrepareChanges}
+              onPrepareChanges={() => acceptPrivate(item, () => onPrepareChanges?.(overview.unsortedRevision))}
               onDismiss={() => {
                 rememberUnsortedDismissed(chatId, overview.unsortedRevision, storage)
                 setDismissRevision(value => value + 1)
@@ -176,20 +289,25 @@ export default function ContributionReviewCard({
           rememberReviewItemDismissed(item, storage)
           setDismissRevision(value => value + 1)
         }
-        // Opening the durable review consumes this version-scoped doorway. A
-        // revised review gets a new dismissal identity and can surface again.
         const onOpenContribute = contributeApp && onOpenApp
-          ? (intent) => {
+          ? intent => {
               onOpenApp(contributeApp, { final: true, intent })
               onDismiss()
             }
           : null
         if (item.kind === 'stack') {
+          const blocker = stackSendBlocker(item, {
+            connected: data?.connected !== false,
+          })
           return (
             <StackReviewRow
-              key={item.id}
+              key={itemRevision(item)}
               item={item}
+              blocker={blocker}
+              failure={actionFailures[item.id]}
+              onPublish={() => setConfirmingItems([item])}
               onOpenContribute={onOpenContribute}
+              onStartAgent={() => acceptPrivate(item, () => onContributeAll?.(overview.workflowRevision))}
               onDismiss={onDismiss}
             />
           )
@@ -198,28 +316,33 @@ export default function ContributionReviewCard({
         if (isTrackingRecord(record)) {
           return (
             <TrackingRow
-              key={item.id}
+              key={itemRevision(item)}
               record={record}
-              turnActive={turnActive}
-              onContinueInChat={onContinueInChat}
+              onContinueInChat={() => acceptPrivate(item, () => onContinueInChat?.(record))}
               onDismiss={onDismiss}
             />
           )
         }
         return (
           <ReviewRow
-            key={item.id}
+            key={itemRevision(item)}
             record={record}
             connected={data?.connected !== false}
-            onPublish={publish}
-            onPublished={rememberPublished}
-            appToken={appToken}
-            onOpenChat={onOpenChat}
+            onPublish={() => publishItem(item)}
+            onFix={() => fixItem(item)}
             onOpenContribute={onOpenContribute}
             onDismiss={onDismiss}
+            failure={actionFailures[record.id]}
           />
         )
       })}
+      {confirmingItems ? (
+        <StackPublicationConfirmation
+          items={confirmingItems}
+          onCancel={() => setConfirmingItems(null)}
+          onConfirm={publishConfirmedItems}
+        />
+      ) : null}
     </div>
   )
 }
@@ -365,16 +488,20 @@ function useSwipeToDismiss(onDismiss) {
 }
 
 
-function StackReviewRow({ item, onOpenContribute, onDismiss }) {
+function StackReviewRow({
+  item, blocker, failure, onPublish, onOpenContribute, onStartAgent, onDismiss,
+}) {
   const cardRef = useSwipeToDismiss(onDismiss)
   const total = Number(item.stack?.total) || item.records.length
   const name = item.stack?.name || 'This improvement'
   const intent = reviewItemIntent(item)
+  const action = publicationStackAction(item)
+  const needsRepair = Boolean(failure || blocker)
 
   return (
     <div ref={cardRef} className="contrib-card contrib-card--stack">
       <div className="contrib-card__topline">
-        <span>Review together</span>
+        <span>{needsRepair ? 'Review together' : 'Ready to send'}</span>
         <button
           type="button"
           className="contrib-card__dismiss"
@@ -389,23 +516,51 @@ function StackReviewRow({ item, onOpenContribute, onDismiss }) {
       </p>
       {item.repo ? <p className="contrib-card__meta">{item.repo}</p> : null}
       <p className="contrib-card__payoff">
-        Contribute keeps the layers in order and opens one decision.
+        {failure?.message || blocker || `${action.count} exact pull requests will open in order after approval.`}
       </p>
       <div className="contrib-card__actions">
         <button
           type="button"
           className="contrib-card__send"
+          disabled={needsRepair ? !onStartAgent : !onPublish}
+          onClick={() => needsRepair ? onStartAgent?.() : onPublish?.()}
+        >
+          {needsRepair ? 'Fix and review stack' : action.label}
+        </button>
+        <button
+          type="button"
+          className="contrib-card__review"
           disabled={!onOpenContribute || !intent}
           onClick={() => onOpenContribute?.(intent)}
         >
-          Review stack in Contribute
+          Details
         </button>
       </div>
     </div>
   )
 }
 
-function TrackingRow({ record, turnActive, onContinueInChat, onDismiss }) {
+function StackPublicationConfirmation({ items, onCancel, onConfirm }) {
+  const action = publicationItemsAction(items)
+  return (
+    <div
+      className="contrib-card-stack__confirm"
+      role="alertdialog"
+      aria-label="Confirm reviewed contribution actions"
+    >
+      <strong>{action.promptLabel}</strong>
+      <span>GitHub will receive only these exact reviewed heads. Nothing is merged.</span>
+      <div className="contrib-card__actions">
+        <button type="button" className="contrib-card__review" onClick={onCancel}>Keep private</button>
+        <button type="button" className="contrib-card__send" onClick={onConfirm}>
+          {action.confirmLabel}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function TrackingRow({ record, onContinueInChat, onDismiss }) {
   const cardRef = useSwipeToDismiss(onDismiss)
   const canContinue = record.needs_attention === true
     && typeof onContinueInChat === 'function'
@@ -442,7 +597,7 @@ function TrackingRow({ record, turnActive, onContinueInChat, onDismiss }) {
             className="contrib-card__send"
             onClick={() => onContinueInChat(record)}
           >
-            {turnActive ? 'Queue agent follow-up' : 'Ask agent to fix'}
+            Ask agent to fix
           </button>
         </div>
       ) : null}
@@ -452,103 +607,18 @@ function TrackingRow({ record, turnActive, onContinueInChat, onDismiss }) {
 
 
 function ReviewRow({
-  record, connected, onPublish, onPublished, appToken, onOpenChat,
-  onOpenContribute, onDismiss,
+  record, connected, onPublish, onFix, onOpenContribute, onDismiss, failure = null,
 }) {
-  const [sending, setSending] = useState(false)
-  const [attemptFailure, setAttemptFailure] = useState(null)
-  const [startingReview, setStartingReview] = useState(false)
-  const [reviewRun, setReviewRun] = useState(null)
-  const [reviewStartError, setReviewStartError] = useState('')
   const diffStat = diffStatSummary(record.diff_stat)
-  const submitting = record.status === 'submitting'
-  const busy = sending || submitting
   const cardRef = useSwipeToDismiss(onDismiss)
-  const failure = submitFailure(record, {
-    attempt: attemptFailure,
-    sending: busy,
-  })
   const intent = contributionReviewIntent(record)
   const blocker = sendBlocker(record, { connected })
   const action = publicationAction(record)
-  const recovery = contributionRecoveryAction(record)
-  const reviewQueryKey = ['contribution-review-run', recovery?.scope || 'none']
-  const { data: existingReview, isLoading: checkingReview } = useQuery({
-    queryKey: reviewQueryKey,
-    enabled: !!failure && !!appToken && !!recovery?.scope,
-    staleTime: 5000,
-    retry: false,
-    queryFn: async () => {
-      const response = await api.appChats.listWithToken(appToken, {
-        scope: recovery.scope,
-      })
-      if (!response.ok) throw new Error('Could not inspect app-owned reviews')
-      const rows = await response.json()
-      const chat = Array.isArray(rows) ? rows[0] : null
-      if (!chat?.id) return null
-      const runtimeResponse = await api.chats.runtime(chat.id, { timeoutMs: 5000 })
-      const runtime = runtimeResponse.ok ? await runtimeResponse.json() : null
-      return {
-        chatId: String(chat.id),
-        phase: contributionReviewRunPhase(runtime),
-      }
-    },
-  })
-  const resolvedReview = reviewRun || existingReview
-
-  async function publish() {
-    if (sending || blocker || typeof onPublish !== 'function') return
-    setSending(true)
-    setAttemptFailure(null)
-    try {
-      const outcome = (await onPublish(record)) || {}
-      if (outcome.published) onPublished?.(record.id, outcome.publication)
-      else if (outcome.failure) setAttemptFailure(outcome.failure)
-    } finally {
-      setSending(false)
-    }
-  }
-
-  async function startReview() {
-    if (!appToken || !recovery || startingReview || resolvedReview?.chatId) return
-    setStartingReview(true)
-    setReviewStartError('')
-    try {
-      let timezone = 'UTC'
-      try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' } catch {}
-      const response = await api.appChats.startWithToken(appToken, {
-        title: recovery.title,
-        scope: recovery.scope,
-        scope_label: recovery.scopeLabel,
-        owner_visible: true,
-        content: recovery.draft,
-        cid: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-          ? crypto.randomUUID()
-          : `cid-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-        timezone,
-      })
-      const body = await response.json().catch(() => null)
-      if (!response.ok || !body?.chat_id) throw new Error('Review did not start')
-      let phase = 'running'
-      const runtimeResponse = await api.chats.runtime(body.chat_id, { timeoutMs: 5000 })
-        .catch(() => null)
-      if (runtimeResponse?.ok) {
-        phase = contributionReviewRunPhase(await runtimeResponse.json())
-      }
-      setReviewRun({ chatId: String(body.chat_id), phase })
-    } catch {
-      setReviewStartError('Could not start the review. Nothing was duplicated; try again.')
-    } finally {
-      setStartingReview(false)
-    }
-  }
 
   return (
     <div ref={cardRef} className="contrib-card">
-      {/* The quiet status row also carries dismissal, so the swipe has a visible,
-          pointer- and keyboard-reachable equivalent. */}
       <div className="contrib-card__topline">
-        <span>{statusLabel(record)}</span>
+        <span>{failure ? 'Needs your help' : statusLabel(record)}</span>
         <button
           type="button"
           className="contrib-card__dismiss"
@@ -561,7 +631,6 @@ function ReviewRow({
       <p className="contrib-card__summary">
         {record.summary || record.title || 'An improvement is ready to contribute'}
       </p>
-
       {(record.repo || diffStat) ? (
         <p className="contrib-card__meta">
           {record.repo}
@@ -569,75 +638,13 @@ function ReviewRow({
           {diffStat ? <span>{diffStat}</span> : null}
         </p>
       ) : null}
-
       <p className={failure ? 'contrib-card__error' : 'contrib-card__payoff'}>
-        {failure?.message || (submitting
-          ? 'Contribute is sending this now; its live status is attached to the review.'
-          : blocker || 'The exact reviewed change is ready for your approval.')}
+        {failure?.message || blocker || 'The exact reviewed change is ready for your approval.'}
       </p>
-      {failure?.detail && (
-        <details className="contrib-card__failure-detail">
-          <summary>Technical details</summary>
-          <pre className="contrib-card__body">{failure.detail}</pre>
-        </details>
-      )}
-
       <div className="contrib-card__actions">
-        {failure ? (
+        {!failure && !blocker ? (
           <>
-            {resolvedReview?.chatId ? (
-              <button
-                type="button"
-                className="contrib-card__send"
-                disabled={typeof onOpenChat !== 'function'}
-                onClick={() => onOpenChat?.(resolvedReview.chatId)}
-              >
-                {['running', 'waiting', 'paused'].includes(resolvedReview.phase)
-                  ? 'Review in progress'
-                  : 'Open review conversation'}
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="contrib-card__send"
-                disabled={!appToken || !recovery || startingReview || checkingReview}
-                aria-busy={startingReview || checkingReview}
-                onClick={startReview}
-              >
-                {startingReview
-                  ? 'Starting review…'
-                  : checkingReview
-                    ? 'Checking review…'
-                    : 'Fix and review'}
-              </button>
-            )}
-            {!resolvedReview?.chatId ? (
-              <button
-                type="button"
-                className="contrib-card__review"
-                disabled={!onOpenContribute || !intent || startingReview}
-                onClick={() => onOpenContribute?.(intent)}
-              >
-                Review in Contribute
-              </button>
-            ) : null}
-          </>
-        ) : busy ? (
-          <button
-            type="button"
-            className="contrib-card__send"
-            disabled
-            aria-busy="true"
-          >
-            {action.busyLabel}
-          </button>
-        ) : !blocker ? (
-          <>
-            <button
-              type="button"
-              className="contrib-card__send"
-              onClick={publish}
-            >
+            <button type="button" className="contrib-card__send" onClick={onPublish}>
               {action.label}
             </button>
             <button
@@ -649,25 +656,21 @@ function ReviewRow({
               Review
             </button>
           </>
-        ) : (
-          <button
-            type="button"
-            className="contrib-card__send"
-            disabled={!onOpenContribute || !intent}
-            onClick={() => onOpenContribute?.(intent)}
-          >
-            {reviewDestinationLabel(record)}
+        ) : connected === false ? (
+          <button type="button" className="contrib-card__send" onClick={() => onOpenContribute?.(intent)}>
+            Connect GitHub
           </button>
+        ) : (
+          <>
+            <button type="button" className="contrib-card__send" disabled={!onFix} onClick={onFix}>
+              Fix and review
+            </button>
+            <button type="button" className="contrib-card__review" onClick={() => onOpenContribute?.(intent)}>
+              Details
+            </button>
+          </>
         )}
       </div>
-      {busy ? (
-        <p className="contrib-card__progress" role="status" aria-live="polite">
-          {action.progress}
-        </p>
-      ) : null}
-      {reviewStartError ? (
-        <p className="contrib-card__error" role="status">{reviewStartError}</p>
-      ) : null}
     </div>
   )
 }

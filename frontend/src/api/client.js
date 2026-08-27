@@ -691,6 +691,21 @@ export const api = {
         },
       )
     },
+    publishStack: (appId, records) => {
+      const prepared = (Array.isArray(records) ? records : [])
+        .filter(record => record?.status === 'prepared')
+      const updating = prepared.length > 0
+        && prepared.every(record => record?.action === 'pr_update')
+      return apiFetch(
+        `/github/contributions/${appId}/${updating ? 'update-stack' : 'submit-stack'}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            record_ids: (records || []).map(record => record.id),
+          }),
+        },
+      )
+    },
   },
   push: {
     vapidKey: () => apiFetch('/push/vapid-key'),

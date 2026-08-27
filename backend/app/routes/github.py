@@ -15,11 +15,13 @@ limited to the Contribute submit endpoints. A standalone Send consumes one
 prepared record, rechecks its reviewed branch/diff, pushes to the owner's
 fork, and creates the pull request. An explicitly enumerated stack Send
 validates every parent link and diff before publishing dedicated upstream
-stack branches in order; it is available only when the connected owner can
-push there. A second explicitly confirmed stack action can atomically land a
-fully green chain on an unchanged, unprotected app branch; protected refs are
-never bypassed. An app-scoped github_access token may act only on records from
-its own storage; it cannot use either path as a general GitHub write proxy.
+stack branches in order; a matching stack Update fast-forwards already-open
+layers parent-first without bypassing the same complete-chain review boundary.
+Both are available only when the connected owner can push there. A second
+explicitly confirmed stack action can atomically land a fully green chain on
+an unchanged, unprotected app branch; protected refs are never bypassed. An
+app-scoped github_access token may act only on records from its own storage;
+it cannot use either path as a general GitHub write proxy.
 
 The fetch-free /source-status read is the local companion for Contribute's
 Sources view. It exposes only sanitized repository identity, refs, diff
@@ -129,6 +131,7 @@ from app.github_contribution_git import (
   _reviewed_branch_diff,
   _assert_fresh,
 )
+from app.storage_io import atomic_write
 from app.github_contributions import (
   ContributionSubmitError,
   _CONTRIBUTION_ID,
@@ -243,6 +246,21 @@ class ContributionSubmitBody(BaseModel):
   submitter: Literal["contribute-button", "chat-review-card"] = (
     "contribute-button"
   )
+
+
+class ChatSettlementItem(BaseModel):
+  path: str
+  disposition: Literal[
+    "local-only", "personal", "experimental", "incoming-only", "duplicate",
+  ] = "local-only"
+  summary: str = ""
+
+
+class ChatSettlementBody(BaseModel):
+  # The newest edit timestamp the agent actually reviewed. A later edit to the
+  # same path must return to Unsorted rather than inheriting an old decision.
+  coverage_at: int | float | str
+  items: list[ChatSettlementItem]
 
 
 class AutopilotRespondBody(BaseModel):
@@ -1087,6 +1105,39 @@ def _diff_file_paths(diff_path: Path, limit: int = 40) -> list[str]:
   return paths
 
 
+def _chat_record_coverage_at(record: dict) -> str:
+  """Return the latest source-bearing instant for chat edit reconciliation."""
+  quality = (
+    record.get("quality_review")
+    if isinstance(record.get("quality_review"), dict)
+    else {}
+  )
+  candidates = [
+    record.get("coverage_at"),
+    quality.get("reviewed_at"),
+    record.get("last_updated_pr_at"),
+    record.get("submitted_at"),
+  ]
+  parsed: list[tuple[datetime, str]] = []
+  for value in candidates:
+    if not isinstance(value, str) or not value.strip():
+      continue
+    normalized = value.strip()
+    try:
+      instant = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+      continue
+    if instant.tzinfo is None:
+      instant = instant.replace(tzinfo=UTC)
+    parsed.append((instant.astimezone(UTC), normalized))
+  if parsed:
+    return max(parsed, key=lambda item: item[0])[1]
+  for value in (record.get("updated_at"), record.get("created_at")):
+    if isinstance(value, str) and value.strip():
+      return value.strip()
+  return ""
+
+
 def _chat_review_projection(record: dict, app_id: int) -> dict:
   """The small, display-only view shared by chat actions and Changes."""
   plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
@@ -1150,6 +1201,11 @@ def _chat_review_projection(record: dict, app_id: int) -> dict:
     "last_submit_error": text(record.get("last_submit_error")),
     "last_submit_error_detail": text(record.get("last_submit_error_detail")),
     "updated_at": text(record.get("updated_at")),
+    # The edit ledger is chronological while contribution paths are reusable.
+    # Expose the last instant this record could have incorporated source edits
+    # so a later edit to the same file returns to Unsorted instead of being
+    # hidden forever by an old PR that happened to touch that path.
+    "coverage_at": _chat_record_coverage_at(record),
     "quality_review_ready": bool(
       isinstance(record.get("quality_review"), dict)
       and record["quality_review"].get("state") == "all_clear"
@@ -1169,6 +1225,135 @@ _CHAT_CONTRIBUTION_STATUSES = frozenset({
   "prepared", "submitting", "draft", "open", "landing", "merged",
   "superseded", "closed",
 })
+
+_CHAT_ID_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_SETTLEMENT_SOURCE_PATH = re.compile(
+  r"^/data/(?:platform/|apps/[A-Za-z0-9_.-]+/).+"
+)
+
+
+def _chat_settlement_path(app_id: int, chat_id: str) -> Path | None:
+  if not _CHAT_ID_SAFE.fullmatch(chat_id):
+    return None
+  return (
+    Path(get_settings().data_dir) / "apps" / str(app_id)
+    / "chat-settlements" / f"{chat_id}.json"
+  )
+
+
+def _settlement_projection(document: object) -> list[dict]:
+  if not isinstance(document, dict) or not isinstance(document.get("items"), list):
+    return []
+  projected: list[dict] = []
+  for raw in document["items"][:500]:
+    if not isinstance(raw, dict):
+      continue
+    path = raw.get("path")
+    disposition = raw.get("disposition")
+    coverage_at = raw.get("coverage_at")
+    if not (
+      isinstance(path, str)
+      and _SETTLEMENT_SOURCE_PATH.fullmatch(path)
+      and disposition in {
+        "local-only", "personal", "experimental", "incoming-only", "duplicate",
+      }
+      and isinstance(coverage_at, (int, float, str))
+      and not isinstance(coverage_at, bool)
+    ):
+      continue
+    projected.append({
+      "id": f"local:{hashlib.sha256(path.encode()).hexdigest()[:20]}",
+      "kind": "local",
+      "path": path,
+      "disposition": disposition,
+      "summary": (
+        raw.get("summary", "")[:160]
+        if isinstance(raw.get("summary"), str) else ""
+      ),
+      "coverage_at": coverage_at,
+      "updated_at": (
+        raw.get("updated_at", "")
+        if isinstance(raw.get("updated_at"), str) else ""
+      ),
+    })
+  projected.sort(key=lambda item: (item["path"], str(item["coverage_at"])))
+  return projected
+
+
+def _settlement_coverage_ms(value: int | float | str) -> int:
+  parsed: float
+  if isinstance(value, (int, float)) and not isinstance(value, bool):
+    parsed = float(value)
+    if parsed < 100_000_000_000:
+      parsed *= 1000
+  elif isinstance(value, str):
+    try:
+      parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000
+    except ValueError as exc:
+      raise HTTPException(status_code=422, detail="coverage_at is not a valid instant.") from exc
+  else:
+    raise HTTPException(status_code=422, detail="coverage_at is not a valid instant.")
+  now_ms = time.time() * 1000
+  if not (0 < parsed <= now_ms + 300_000):
+    raise HTTPException(status_code=422, detail="coverage_at is outside the valid range.")
+  return int(parsed)
+
+
+def _chat_action_key(record: dict, review: object) -> str:
+  """Stable identity for one meaningful card action, excluding poll timestamps."""
+  plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+  attention = record.get("attention") if isinstance(record.get("attention"), dict) else {}
+  review_code = review.get("code") if isinstance(review, dict) else ""
+  identity = json.dumps({
+    "status": record.get("status"),
+    "action": plan.get("action"),
+    "head": plan.get("head_sha"),
+    "attention": attention.get("key"),
+    "needs_attention": record.get("needs_attention") is True,
+    "submit_error": record.get("last_submit_error_code") or record.get("last_submit_error"),
+    "submit_stage": record.get("last_submit_stage"),
+    "review": review_code,
+  }, sort_keys=True, separators=(",", ":"), default=str)
+  return hashlib.sha256(identity.encode()).hexdigest()[:24]
+
+
+def _contribution_chat_ids(record: dict) -> tuple[str, ...]:
+  """Return every chat whose edits this one contribution has reconciled.
+
+  ``chat_id`` remains the creation/provenance owner. ``chat_ids`` is additive:
+  an agent appends to it when a later chat refines the same review instead of
+  creating a duplicate contribution. Keeping the primary id in the projection
+  preserves old records and lets a bounded list express the real many-to-one
+  relationship without moving ownership away from the original conversation.
+  """
+  values: list[object] = [record.get("chat_id")]
+  linked = record.get("chat_ids")
+  if isinstance(linked, list):
+    values.extend(linked[:32])
+  chat_ids: list[str] = []
+  for value in values:
+    if not isinstance(value, str):
+      continue
+    normalized = value.strip()
+    if normalized and normalized not in chat_ids:
+      chat_ids.append(normalized)
+  return tuple(chat_ids)
+
+
+def _chat_stack_key(record: dict) -> tuple[str, str] | None:
+  """Return the ledger identity of a stack without exposing its ancestry."""
+  plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+  stack = plan.get("stack") if isinstance(plan.get("stack"), dict) else {}
+  stack_id = str(stack.get("id") or "").strip()
+  repo = str(plan.get("repo") or record.get("repo") or "").strip()
+  return (repo, stack_id) if repo and stack_id else None
+
+
+def _chat_stack_position(record: dict) -> int:
+  plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+  stack = plan.get("stack") if isinstance(plan.get("stack"), dict) else {}
+  value = stack.get("position")
+  return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 @router.get("/contributions/{app_id}/for-chat/{chat_id}")
@@ -1193,8 +1378,9 @@ async def contributions_for_chat(
   _validate_submit_app(app_id, principal, db)
   db.close()
   contribution_dir = _contributions_dir(app_id)
+  settlement_path = _chat_settlement_path(app_id, chat_id)
   async with fs_locks.app_storage_lock(app_id):
-    records = []
+    all_records = []
     if contribution_dir.exists():
       for path in contribution_dir.glob("*.json"):
         record = _read_record_tolerant(path)
@@ -1202,19 +1388,101 @@ async def contributions_for_chat(
           record is not None
           and isinstance(record.get("id"), str)
           and _CONTRIBUTION_ID.match(record["id"])
-          and str(record.get("chat_id") or "") == chat_id
           and record.get("type") == "pr"
           and record.get("status") in _CHAT_CONTRIBUTION_STATUSES
         ):
-          records.append(record)
+          all_records.append(record)
     settings_path = (
       Path(get_settings().data_dir) / "apps" / str(app_id) / "settings.json"
     )
     app_settings = _read_record_tolerant(settings_path) or {}
+    settlement_document = (
+      _read_record_tolerant(settlement_path)
+      if settlement_path is not None and settlement_path.is_file()
+      else None
+    )
 
+  records = [
+    record for record in all_records
+    if chat_id in _contribution_chat_ids(record)
+  ]
   records.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
 
   github_state = github_auth.read_state() or {}
+  chat_stack_keys = {
+    key for record in records
+    if (key := _chat_stack_key(record)) is not None
+  }
+  stack_keys = {
+    key for key in chat_stack_keys
+    if any(
+      record.get("status") == "prepared" and _chat_stack_key(record) == key
+      for record in all_records
+    )
+  }
+  stack_units = []
+  for repo, stack_id in sorted(stack_keys):
+    members = [
+      record for record in all_records
+      if _chat_stack_key(record) == (repo, stack_id)
+    ]
+    try:
+      ordered = [
+        item["record"] for item in _validate_stack_records(
+          members,
+          allowed_actions=_PREPARED_PR_ACTIONS,
+        )
+      ]
+      structural_problem = None
+    except ContributionSubmitError as exc:
+      ordered = sorted(
+        members,
+        key=_chat_stack_position,
+      )
+      structural_problem = _review_status_problem(
+        stack_id,
+        code="invalid_stack",
+        detail=exc.message,
+      )
+
+    member_views = []
+    for member in ordered:
+      review = None
+      if member.get("status") == "prepared":
+        member_id = str(member.get("id") or "")
+        if structural_problem is not None:
+          review = {**structural_problem, "id": member_id}
+        else:
+          plan = member.get("plan") if isinstance(member.get("plan"), dict) else {}
+          _, diff_path = _record_paths(app_id, member_id)
+          try:
+            repo_path = _safe_repo_path(plan.get("repo_path"))
+          except ContributionSubmitError as exc:
+            review = _review_status_problem(
+              member_id,
+              code=exc.code or "invalid_checkout",
+              detail=exc.message,
+            )
+          else:
+            async with fs_locks.source_dir_lock(str(repo_path)):
+              review = await asyncio.to_thread(
+                _inspect_prepared_review, member, diff_path, github_state,
+              )
+      view = _chat_review_projection(member, app_id)
+      view["review"] = review
+      view["action_key"] = _chat_action_key(member, review)
+      member_views.append(view)
+
+    stack_name = ""
+    if member_views:
+      stack_name = str((member_views[0].get("stack") or {}).get("name") or "")
+    stack_units.append({
+      "id": stack_id,
+      "name": stack_name,
+      "repo": repo,
+      "records": member_views,
+    })
+
   projections = []
   for record in records:
     view = _chat_review_projection(record, app_id)
@@ -1236,6 +1504,7 @@ async def contributions_for_chat(
             _inspect_prepared_review, record, diff_path, github_state,
           )
     view["review"] = review
+    view["action_key"] = _chat_action_key(record, review)
     projections.append(view)
 
   autopilot_default = app_settings.get("autopilot_default")
@@ -1247,6 +1516,98 @@ async def contributions_for_chat(
       True if autopilot_default is None else bool(autopilot_default)
     ),
     "records": projections,
+    # A chat owns only the layers it created or refined, but approving a stack
+    # must name the complete immutable chain. Keep lifecycle rows chat-scoped
+    # and expose complete approval units separately so no surface ever sends a
+    # lone child or summons another review for an already-ready stack.
+    "stack_units": stack_units,
+    "settlements": _settlement_projection(settlement_document),
+  }
+
+
+@router.post(
+  "/contributions/{app_id}/for-chat/{chat_id}/settle",
+  dependencies=[Depends(reject_cross_site)],
+)
+@_limiter.limit("30/minute")
+async def settle_chat_changes(
+  request: Request,
+  app_id: int,
+  chat_id: str,
+  body: ChatSettlementBody,
+  db: Session = Depends(get_db),
+  principal: Principal = Depends(get_principal),
+):
+  """Durably classify reviewed chat edits that intentionally stay local.
+
+  This is a temporal disposition, not a fake contribution record. The agent
+  supplies the newest edit instant it actually reviewed; edits after that
+  instant naturally return to Unsorted. Repeating the same write is idempotent,
+  and an older retry can never roll a path's coverage backwards.
+  """
+  _validate_submit_app(app_id, principal, db)
+  if principal.app_id is not None:
+    raise HTTPException(status_code=403, detail="Owner authority is required.")
+  db.close()
+  path = _chat_settlement_path(app_id, chat_id)
+  if path is None:
+    raise HTTPException(status_code=422, detail="Invalid chat id.")
+  if not 1 <= len(body.items) <= 500:
+    raise HTTPException(status_code=422, detail="Provide between 1 and 500 paths.")
+  coverage_at = _settlement_coverage_ms(body.coverage_at)
+  now = _now_iso()
+  normalized: dict[str, dict] = {}
+  for item in body.items:
+    source_path = item.path.strip().replace("\\", "/")
+    if (
+      len(source_path) > 1024
+      or not _SETTLEMENT_SOURCE_PATH.fullmatch(source_path)
+      or ".." in Path(source_path).parts
+    ):
+      raise HTTPException(status_code=422, detail=f"Invalid source path: {item.path!r}")
+    summary = item.summary.strip()
+    if len(summary) > 160:
+      raise HTTPException(status_code=422, detail="Settlement summaries are limited to 160 characters.")
+    normalized[source_path] = {
+      "path": source_path,
+      "disposition": item.disposition,
+      "summary": summary,
+      "coverage_at": coverage_at,
+      "updated_at": now,
+    }
+
+  async with fs_locks.app_storage_lock(app_id):
+    current = _read_record_tolerant(path) if path.is_file() else None
+    existing = {
+      item["path"]: {
+        "path": item["path"],
+        "disposition": item["disposition"],
+        "summary": item["summary"],
+        "coverage_at": item["coverage_at"],
+        "updated_at": item["updated_at"],
+      }
+      for item in _settlement_projection(current)
+      if isinstance(item.get("path"), str)
+    }
+    for source_path, item in normalized.items():
+      previous = existing.get(source_path)
+      previous_at = (
+        _settlement_coverage_ms(previous["coverage_at"])
+        if previous is not None else -1
+      )
+      if coverage_at >= previous_at:
+        existing[source_path] = item
+    document = {
+      "version": 1,
+      "chat_id": chat_id,
+      "updated_at": now,
+      "items": sorted(existing.values(), key=lambda item: item["path"]),
+    }
+    atomic_write(path, json.dumps(document, ensure_ascii=False, separators=(",", ":")))
+
+  return {
+    "updated_at": now,
+    "settlements": _settlement_projection(document),
   }
 
 
@@ -1604,6 +1965,238 @@ async def update_existing_contribution(
         exc_info=True,
       )
   return {"record": updated, "url": pr_url, "number": number}
+
+
+@router.post(
+  "/contributions/{app_id}/update-stack",
+  dependencies=[Depends(reject_cross_site)],
+)
+@_limiter.limit("5/minute")
+async def update_contribution_stack(
+  request: Request,
+  app_id: int,
+  body: ContributionStackSubmitRequest,
+  db: Session = Depends(get_db),
+  principal: Principal = Depends(get_principal),
+):
+  """Fast-forward one complete, reviewed chain of already-open PRs.
+
+  Stack members cannot use the standalone update route because advancing a
+  parent changes the commit exposed through every child's base branch. Claim
+  the immutable chain once, then update parent-first so each child is verified
+  against the parent GitHub now exposes. Successful parents remain durable if
+  a later layer fails; every untouched child returns to prepared review.
+  """
+  expected_nonce = _validate_submit_app(app_id, principal, db)
+  from app import contribution_autopilot as autopilot
+  for record_id in body.record_ids:
+    autopilot_row = autopilot.get_row(db, app_id, record_id)
+    if (
+      autopilot_row is not None
+      and autopilot_row.enabled
+      and autopilot_row.state == "responding"
+    ):
+      raise HTTPException(
+        status_code=409,
+        detail=(
+          "Autopilot is already updating a pull request in this stack. "
+          "Try again when it finishes."
+        ),
+      )
+  db.close()
+  async with fs_locks.app_storage_lock(app_id):
+    rows = _claim_stack_records(
+      app_id=app_id,
+      record_ids=body.record_ids,
+      db=db,
+      expected_nonce=expected_nonce,
+      allowed_actions=frozenset({"pr_update"}),
+      submitter="contribute-stack-update-button",
+      already_detail="Every PR in this stack already has the reviewed update.",
+    )
+  db.close()
+  updated_rows = []
+
+  try:
+    lock_paths = {
+      str(_safe_repo_path((row["record"].get("plan") or {}).get("repo_path")))
+      for row in rows
+      if row["record"].get("status") == "submitting"
+    }
+    for row in rows:
+      try:
+        repos = _equivalence_source_repo(row["record"])
+        if repos is not None:
+          lock_paths.add(str(repos[0]))
+      except Exception:
+        pass
+    repo_paths = sorted(lock_paths)
+    async with AsyncExitStack() as source_locks:
+      for repo_path in repo_paths:
+        await source_locks.enter_async_context(
+          fs_locks.source_dir_lock(repo_path)
+        )
+      await asyncio.to_thread(_preflight_prepared_stack, rows)
+
+      for row in rows:
+        record = row["record"]
+        if record.get("status") != "submitting":
+          continue
+        try:
+          repo, number, head_repository, branch = _prepared_existing_pr_target(record)
+          live_target = await asyncio.to_thread(
+            _autopilot_live_target,
+            repo,
+            number,
+            head_repository,
+            branch,
+          )
+          target_error = live_target.get("error")
+          if target_error:
+            raise ContributionSubmitError(
+              "The open pull request changed since this stack update was "
+              "prepared. Nothing was pushed for this layer.",
+              code="review_refresh_needed",
+              detail=target_error,
+            )
+          plan = record.get("plan") or {}
+          repo_path = _safe_repo_path(plan.get("repo_path"))
+          _assert_reviewed_update_contains_live_head(
+            repo_path,
+            str(live_target.get("head_sha") or ""),
+            str(plan.get("head_sha") or ""),
+          )
+          pr_url, returned_number, record_patch = await asyncio.to_thread(
+            _submit_prepared_pr,
+            record,
+            row["diff_path"],
+            direct_base_branch=str(live_target.get("base_branch") or ""),
+            expected_existing_pr_number=number,
+            expected_existing_head_repository=head_repository,
+          )
+          if returned_number != number:
+            raise ContributionSubmitError(
+              "GitHub returned a different pull request for this reviewed stack update."
+            )
+          try:
+            await _record_pending_equivalence_locked(
+              {**record, **(record_patch or {})},
+              already_locked=frozenset(repo_paths),
+            )
+          except Exception:
+            log.warning(
+              "stack update equivalence witness failed %s/%s",
+              app_id,
+              record.get("id"),
+              exc_info=True,
+            )
+        except ContributionSubmitError as exc:
+          async with fs_locks.app_storage_lock(app_id):
+            _recheck_submit_app(db, app_id, expected_nonce)
+            db.close()
+            snapshots = _mark_stack_submit_failure(
+              rows,
+              exc.message,
+              failed_id=str(record.get("id") or ""),
+              record_patch=exc.record_patch,
+              code=exc.code or "",
+              detail=exc.detail,
+            )
+          raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+              "message": exc.message,
+              "detail": exc.detail,
+              "records": snapshots,
+              "updated": updated_rows,
+              **({"code": exc.code} if exc.code else {}),
+            },
+          ) from exc
+
+        async with fs_locks.app_storage_lock(app_id):
+          _recheck_submit_app(db, app_id, expected_nonce)
+          db.close()
+          current = _read_record(row["record_path"])
+          if current.get("status") != "submitting":
+            raise ContributionSubmitError(
+              "This PR stack changed while it was being updated."
+            )
+          updated = _mark_existing_pr_update_success(
+            record_path=row["record_path"],
+            record=current,
+            pr_url=pr_url,
+            number=number,
+            record_patch=record_patch,
+          )
+        updated_rows.append({
+          "id": updated.get("id"),
+          "url": pr_url,
+          "number": number,
+        })
+        pushed_head = str(
+          (record_patch or {}).get("last_submit_push_sha")
+          or ((updated.get("plan") or {}).get("head_sha"))
+          or ""
+        )
+        if pushed_head:
+          try:
+            if autopilot.refresh_granted_head(
+              db,
+              app_id,
+              str(updated.get("id") or ""),
+              head_sha=pushed_head,
+            ):
+              await autopilot.mirror_to_ledger(
+                app_id,
+                str(updated.get("id") or ""),
+              )
+          except Exception:
+            log.warning(
+              "autopilot grant refresh failed after stack update %s/%s",
+              app_id,
+              updated.get("id"),
+              exc_info=True,
+            )
+  except HTTPException:
+    raise
+  except ContributionSubmitError as exc:
+    async with fs_locks.app_storage_lock(app_id):
+      _recheck_submit_app(db, app_id, expected_nonce)
+      db.close()
+      snapshots = _mark_stack_submit_failure(
+        rows,
+        exc.message,
+        record_patch=exc.record_patch,
+        code=exc.code or "",
+        detail=exc.detail,
+      )
+    raise HTTPException(
+      status_code=exc.status_code,
+      detail={
+        "message": exc.message,
+        "detail": exc.detail,
+        "records": snapshots,
+        "updated": updated_rows,
+        **({"code": exc.code} if exc.code else {}),
+      },
+    ) from exc
+  except Exception as exc:
+    log.exception("Contribution stack update failed for app %s", app_id)
+    message = "Could not update this PR stack. Every untouched layer remains privately prepared."
+    async with fs_locks.app_storage_lock(app_id):
+      _recheck_submit_app(db, app_id, expected_nonce)
+      db.close()
+      snapshots = _mark_stack_submit_failure(rows, message)
+    raise HTTPException(
+      status_code=500,
+      detail={"message": message, "records": snapshots, "updated": updated_rows},
+    ) from exc
+
+  async with fs_locks.app_storage_lock(app_id):
+    _recheck_submit_app(db, app_id, expected_nonce)
+    db.close()
+    snapshots = _stack_record_snapshots(rows)
+  return {"records": snapshots, "updated": updated_rows}
 
 
 @router.post(
@@ -2457,14 +3050,14 @@ async def autopilot_reply(
   return {"status": "ok"}
 
 
-def _autopilot_live_target_error(
+def _autopilot_live_target(
   repo: str, number: int, head_repository: str, branch: str,
-) -> str | None:
+) -> dict:
   if not shutil.which("gh"):
-    return "gh is not installed."
+    return {"error": "gh is not installed.", "head_sha": None}
   token = github_auth.get_token()
   if not token:
-    return "GitHub not connected."
+    return {"error": "GitHub not connected.", "head_sha": None}
   env = dict(os.environ)
   env["GH_TOKEN"] = token
   try:
@@ -2473,26 +3066,84 @@ def _autopilot_live_target_error(
       capture_output=True, text=True, timeout=30, env=env,
     )
     if viewed.returncode != 0:
-      return (viewed.stderr or "gh failed.")[:300]
+      return {"error": (viewed.stderr or "gh failed.")[:300], "head_sha": None}
     try:
       live = json.loads(viewed.stdout)
     except json.JSONDecodeError:
-      return "GitHub returned invalid PR metadata."
+      return {"error": "GitHub returned invalid PR metadata.", "head_sha": None}
     if not isinstance(live, dict):
-      return "GitHub returned invalid PR metadata."
-    live_head = (
-      ((live.get("head") or {}).get("repo") or {}).get("full_name")
-    )
-    live_branch = (live.get("head") or {}).get("ref")
+      return {"error": "GitHub returned invalid PR metadata.", "head_sha": None}
+    head = live.get("head") if isinstance(live.get("head"), dict) else {}
+    base = live.get("base") if isinstance(live.get("base"), dict) else {}
+    head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    base_repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
+    live_head_repository = head_repo.get("full_name")
+    live_branch = head.get("ref")
+    live_head_sha = str(head.get("sha") or "")
+    live_base_repository = base_repo.get("full_name")
+    try:
+      live_base_branch = _validate_branch(base.get("ref"))
+    except ContributionSubmitError:
+      live_base_branch = ""
     if (
       live.get("state") != "open"
-      or live_head != head_repository
+      or live_head_repository != head_repository
       or live_branch != branch
+      or not _GIT_SHA.fullmatch(live_head_sha)
+      or live_base_repository != repo
+      or not live_base_branch
     ):
-      return "The live pull request no longer matches the approved target."
+      return {
+        "error": "The live pull request no longer matches the approved target.",
+        "head_sha": None,
+      }
   except (subprocess.TimeoutExpired, OSError) as exc:
-    return str(exc)[:300]
-  return None
+    return {"error": str(exc)[:300], "head_sha": None}
+  return {
+    "error": None,
+    "head_sha": live_head_sha,
+    "base_branch": live_base_branch,
+  }
+
+
+def _autopilot_live_target_error(
+  repo: str, number: int, head_repository: str, branch: str,
+) -> str | None:
+  """Compatibility view for callers that only need target identity drift."""
+  return _autopilot_live_target(
+    repo, number, head_repository, branch,
+  ).get("error")
+
+
+def _assert_reviewed_update_contains_live_head(
+  repo_path: Path,
+  live_head_sha: str,
+  reviewed_head_sha: str,
+) -> None:
+  """Refuse a reviewed update that would overwrite newer PR branch work."""
+  if not (
+    _GIT_SHA.fullmatch(live_head_sha)
+    and _GIT_SHA.fullmatch(reviewed_head_sha)
+  ):
+    raise ContributionSubmitError(
+      "This pull request needs a fresh review before it can be updated. Nothing was pushed.",
+      code="review_refresh_needed",
+    )
+  ancestry = _git(
+    repo_path,
+    "merge-base",
+    "--is-ancestor",
+    live_head_sha,
+    reviewed_head_sha,
+    check=False,
+  )
+  if ancestry.returncode != 0:
+    raise ContributionSubmitError(
+      "This pull request changed after the update was reviewed. Nothing was pushed. "
+      "Ask the agent to refresh and review it against the current pull request.",
+      code="review_refresh_needed",
+      detail="The reviewed branch does not contain the pull request's current head.",
+    )
 
 
 def _autopilot_post_reply(

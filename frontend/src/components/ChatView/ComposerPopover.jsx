@@ -261,7 +261,7 @@ export default function ComposerPopover({
 
   function handleOpenChanges() {
     setOpen(false)
-    onOpenChanges?.()
+    onOpenChanges?.(triggerRef.current)
   }
 
   function handleOpenArtifact(artifactId) {

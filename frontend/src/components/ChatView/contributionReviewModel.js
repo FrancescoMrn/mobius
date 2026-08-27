@@ -118,8 +118,66 @@ export function autopilotOnSend(payload) {
 /** Copy for the one public action represented by this prepared record. */
 export function publicationAction(record) {
   return record?.action === 'pr_update'
-    ? { label: 'Update PR', busyLabel: 'Updating PR', progress: 'Updating the reviewed pull request…' }
-    : { label: 'Send PR', busyLabel: 'Sending PR', progress: 'Opening the reviewed pull request…' }
+    ? { label: 'Update PR', busyLabel: 'Updating PR' }
+    : { label: 'Send PR', busyLabel: 'Sending PR' }
+}
+
+/** Why one complete reviewed stack cannot use its guarded public action yet. */
+export function stackSendBlocker(item, { connected } = {}) {
+  if (item?.kind !== 'stack') return 'This is not a complete contribution stack.'
+  const records = Array.isArray(item.records) ? item.records : []
+  const total = Number(item.stack?.total)
+  const positions = new Set(records.map(record => Number(record?.stack?.position)))
+  if (!Number.isInteger(total) || total < 2
+    || records.length !== total || positions.size !== total
+    || !Array.from({ length: total }, (_, index) => index + 1)
+      .every(position => positions.has(position))) {
+    return 'The complete linked set needs another review before it can continue.'
+  }
+  if (connected === false) return 'Connect GitHub in Contribute before sending.'
+  const prepared = records.filter(record => record?.status === 'prepared')
+  if (prepared.length === 0) return 'This contribution stack has no private action waiting.'
+  const actions = new Set(prepared.map(record => record?.action || 'pr'))
+  if (actions.size !== 1) return 'The linked set needs one consistent public action.'
+  for (const record of prepared) {
+    if (typeof record.last_submit_error === 'string' && record.last_submit_error.trim()) {
+      return 'This contribution stack needs a fresh check before it can continue.'
+    }
+    if (record.quality_review_ready !== true || record.review?.state !== 'ready') {
+      return record.review?.message || 'Finish the exact agent review before sending.'
+    }
+  }
+  return null
+}
+
+export function publicationStackAction(item) {
+  const prepared = (item?.records || []).filter(record => record?.status === 'prepared')
+  const updating = prepared.length > 0
+    && prepared.every(record => record?.action === 'pr_update')
+  return {
+    label: updating ? 'Update stack' : 'Send stack',
+    confirmLabel: updating ? 'Update PRs' : 'Send PRs',
+    count: prepared.length,
+    updating,
+  }
+}
+
+/** Exact public actions represented by one confirmation, regardless of grouping. */
+export function publicationItemsAction(items) {
+  const records = (Array.isArray(items) ? items : []).flatMap(item => (
+    item?.kind === 'stack'
+      ? (item.records || []).filter(record => record?.status === 'prepared')
+      : [item?.record].filter(Boolean)
+  ))
+  const updating = records.length > 0
+    && records.every(record => record?.action === 'pr_update')
+  const verb = updating ? 'Update' : 'Send'
+  return {
+    count: records.length,
+    updating,
+    promptLabel: `${verb} ${records.length} reviewed pull ${records.length === 1 ? 'request' : 'requests'}?`,
+    confirmLabel: `${verb} ${records.length} ${records.length === 1 ? 'PR' : 'PRs'}`,
+  }
 }
 
 // The platform repository remains useful in tests and record grouping, but the
@@ -304,30 +362,77 @@ export function reviewPanelSummary(items) {
 export function reviewGroupDefault(items, { connected } = {}) {
   const list = (Array.isArray(items) ? items : []).filter(Boolean)
   if (list.length < 2) return null
-  if (list.some(item => item?.kind === 'unsorted')) return null
-  if (list.some(
+  const hasUnsorted = list.some(item => item?.kind === 'unsorted')
+  const hasTracking = list.some(
     item => item?.kind === 'record' && isTrackingRecord(item.record),
-  )) return null
-  const records = list.flatMap(item => item?.kind === 'record' ? [item.record] : [])
-  const canPublishTogether = records.length === list.length && records.every(
-    record => record?.status === 'prepared' && !sendBlocker(record, { connected }),
   )
-  if (canPublishTogether) {
-    const updates = records.filter(record => record?.action === 'pr_update').length
+  if (hasUnsorted || hasTracking) {
     return {
-      kind: 'publish',
-      records,
-      label: updates === records.length
-        ? `Update all ${records.length}`
-        : `Send all ${records.length}`,
-      busyLabel: `Sending 0 of ${records.length}`,
+      kind: 'contribute',
+      label: 'Handle all',
+    }
+  }
+  const canPublishItem = item => item?.kind === 'stack'
+    ? !stackSendBlocker(item, { connected })
+    : item?.kind === 'record'
+      && item.record?.status === 'prepared'
+      && !sendBlocker(item.record, { connected })
+  const canPublishTogether = list.every(canPublishItem)
+  if (canPublishTogether) {
+    const updates = list.filter(item => item?.kind === 'stack'
+      ? publicationStackAction(item).updating
+      : item.record?.action === 'pr_update').length
+    const allStacks = list.every(item => item?.kind === 'stack')
+    return {
+      kind: 'publish-items',
+      items: list,
+      label: allStacks && list.length === 2
+        ? `${updates === list.length ? 'Update' : 'Send'} both stacks`
+        : `${updates === list.length ? 'Update' : 'Send'} all ${list.length}${allStacks ? ' stacks' : ''}`,
     }
   }
   return {
     kind: 'review',
     intent: 'reviews:queue',
-    label: `Review all ${list.length}`,
+    label: `Fix and review all ${list.length}`,
   }
+}
+
+const OWNER_FAILURE_CODES = new Set([
+  'github_not_connected', 'missing_github_token', 'forbidden',
+  'insufficient_permission', 'permission_denied',
+])
+
+/** Decide who owns a failed public action after the server reconciles it. */
+export function publicationFailureOwner(failure) {
+  const status = Number(failure?.status)
+  const code = String(failure?.code || '').toLowerCase()
+  if (status === 401 || status === 403 || OWNER_FAILURE_CODES.has(code)) return 'owner'
+  return 'agent'
+}
+
+/** One accepted-action identity; a changed review naturally returns. */
+export function reviewActionKey(record) {
+  if (!record?.id) return ''
+  if (typeof record.action_key === 'string' && record.action_key) {
+    return `${record.id}:${record.action_key}`
+  }
+  if (isTrackingRecord(record) && contributionNeedsAttentionFallback(record)) {
+    return [
+      record.id,
+      record.status || '',
+      record.needs_attention === true ? 'attention' : '',
+      record.last_submit_error || '',
+      record.review?.code || '',
+    ].join(':')
+  }
+  return `${record.id}:${record.updated_at || ''}:${record.status || ''}`
+}
+
+function contributionNeedsAttentionFallback(record) {
+  return record?.needs_attention === true
+    || Boolean(String(record?.last_submit_error || '').trim())
+    || record?.review?.state === 'needs_refresh'
 }
 
 // ── Swipe-to-dismiss ────────────────────────────────────────────────────────
@@ -429,7 +534,28 @@ function stackDescriptor(record) {
 export function reviewItems(payload) {
   const items = []
   const stacks = new Map()
-  for (const record of chatCardRecords(payload)) {
+  const records = chatCardRecords(payload)
+  const chatRecordIds = new Set(chatContributionRecords(payload).map(record => record.id))
+  const represented = new Set()
+  for (const unit of Array.isArray(payload?.stack_units) ? payload.stack_units : []) {
+    const unitRecords = Array.isArray(unit?.records) ? unit.records : []
+    if (!unitRecords.some(record => chatRecordIds.has(record?.id))) continue
+    const stack = unitRecords.map(stackDescriptor).find(Boolean)
+    if (!stack) continue
+    const item = {
+      kind: 'stack',
+      id: `stack:${unit.repo || ''}:${unit.id || stack.id}`,
+      stack: { ...stack, name: unit.name || stack.name },
+      repo: unit.repo || unitRecords[0]?.repo,
+      records: [...unitRecords].sort((left, right) => (
+        (stackDescriptor(left)?.position || 0) - (stackDescriptor(right)?.position || 0)
+      )),
+    }
+    item.records.forEach(record => represented.add(record.id))
+    items.push(item)
+  }
+  for (const record of records) {
+    if (represented.has(record.id)) continue
     const stack = ACTIONABLE_STATUSES.has(record.status)
       ? stackDescriptor(record)
       : null
