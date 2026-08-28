@@ -39,6 +39,30 @@ test('a lost stack response reconciles every linked action before retrying', asy
   assert.equal(outcome.kind, 'reconciled')
 })
 
+test('a completed stack reconciles from the full lifecycle after leaving stack units', async () => {
+  const records = [
+    { id: 'one', status: 'draft', action_key: 'stack-one' },
+    { id: 'two', status: 'prepared', action_key: 'stack-two' },
+  ]
+  const outcome = await publishContributionStack({
+    appId: 80,
+    item: { kind: 'stack', records },
+    publish: async () => { throw new Error('connection reset') },
+    refetch: async () => ({ data: {
+      records: [
+        { id: 'unrelated', status: 'open' },
+        { ...records[0], action_key: 'lifecycle-one' },
+        { ...records[1], status: 'open', action_key: 'lifecycle-two' },
+      ],
+      stack_units: [],
+    } }),
+  })
+
+  assert.equal(outcome.kind, 'reconciled')
+  assert.deepEqual(outcome.records.map(record => record.id), ['one', 'two'])
+  assert.equal(outcome.records[1].status, 'open')
+})
+
 test('a lost response reconciles a record that already advanced', async () => {
   const record = { id: 'one', status: 'prepared', updated_at: 'old' }
   const outcome = await publishContribution({

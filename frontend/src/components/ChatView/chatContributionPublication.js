@@ -92,17 +92,26 @@ export async function publishContributionStack({
   const refreshed = typeof refetch === 'function'
     ? await refetch().catch(() => null)
     : null
-  const latest = new Map(
+  const lifecycle = new Map(
+    (refreshed?.data?.records || []).map(record => [record.id, record]),
+  )
+  const stacked = new Map(
     (refreshed?.data?.stack_units || [])
       .flatMap(unit => unit?.records || [])
       .map(record => [record.id, record]),
   )
   const advanced = records.some(record => {
-    const current = latest.get(record.id)
+    const current = stacked.get(record.id) || lifecycle.get(record.id)
     return current && (
-      current.status !== record.status || current.action_key !== record.action_key
+      current.status !== record.status
+      || (stacked.has(record.id) && current.action_key !== record.action_key)
     )
   })
-  if (advanced) return { kind: 'reconciled', records: [...latest.values()] }
+  if (advanced) return {
+    kind: 'reconciled',
+    records: records
+      .map(record => stacked.get(record.id) || lifecycle.get(record.id))
+      .filter(Boolean),
+  }
   return { kind: 'failed', failure, records }
 }
