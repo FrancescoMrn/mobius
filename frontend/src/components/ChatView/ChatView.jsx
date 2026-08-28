@@ -47,7 +47,12 @@ import ChatDiffViewer from './ChatDiffViewer.jsx'
 import ChatUsageInspector from './ChatUsageInspector.jsx'
 import ChatUsageStrip from './ChatUsageStrip.jsx'
 import { formatUsageAriaSummary } from './chatUsageFormat.js'
-import { chatContributionPrepareSubmission } from './chatContributionIntent.js'
+import {
+  CHAT_CONTRIBUTION_FINISH_PROMPT,
+  CHAT_CONTRIBUTION_PREPARE_PROMPT,
+  openContributionUpdatePrompt,
+  projectContributionPreparePrompt,
+} from './chatContributionIntent.js'
 import ComposerPopover from './ComposerPopover.jsx'
 import BrainUsageButton from './BrainUsageButton.jsx'
 import ConnectionStatus from './ConnectionStatus.jsx'
@@ -57,7 +62,10 @@ import WaitingChip from './WaitingChip.jsx'
 import ActiveAssistantSurface from './ActiveAssistantSurface.jsx'
 import QueuedMessages from './QueuedMessages.jsx'
 import ContributionReviewCard from './ContributionReviewCard.jsx'
-import { contributionFollowupPrompt } from './contributionReviewModel.js'
+import {
+  contributionFollowupPrompt,
+  reviewActionKey,
+} from './contributionReviewModel.js'
 import MsgContent from './MsgContent.jsx'
 import MessageMetaRow from './MessageMetaRow.jsx'
 import ActivityLineHeader from './ActivityLineHeader.jsx'
@@ -575,6 +583,7 @@ export default function ChatView({
   const [showSummary, setShowSummary] = useState(false)
   const [showChanges, setShowChanges] = useState(false)
   const [showUsage, setShowUsage] = useState(false)
+  const changesReturnFocusRef = useRef(null)
   const [visibleMessageMetaKey, setVisibleMessageMetaKey] = useState(null)
   const messageMetaTimerRef = useRef(null)
   const [previewReadyStatus, setPreviewReadyStatus] = useState('')
@@ -4010,19 +4019,87 @@ export default function ChatView({
   // (The fast-forward identity/readiness gates are computed separately below.)
   const turnActive = sending || isStreaming || serverRunning
 
-  const handlePrepareChatChanges = useCallback(() => {
+  // Contribution cards and Changes share one semantic claim set. A click is
+  // claimed synchronously (before React can rerender), so a rapid second tap or
+  // a second surface cannot append the same agent request again. Claims live
+  // until the resulting queued/running work settles; meaningful record/edit
+  // revisions receive a different key and remain actionable.
+  const contributionIntentClaimsRef = useRef(new Set())
+  const contributionWasActiveRef = useRef(turnActive)
+
+  const sendContributionIntent = useCallback(async (key, prompt) => {
+    if (!key || contributionIntentClaimsRef.current.has(key)) return false
+    contributionIntentClaimsRef.current.add(key)
+    await doSend(prompt, { attachments: [], preserveComposer: true })
+    const promptPresent = [
+      ...(pendingQueue.pendingMessagesRef.current || []),
+      ...(messagesRef.current || []).slice(-12),
+    ].some(message => (
+      message?.role === 'user'
+      && String(message?.content || '').startsWith(prompt)
+    ))
+    const accepted = promptPresent || sendingRef.current
+      || isStreamingRef.current || serverRunningRef.current
+    if (!accepted) contributionIntentClaimsRef.current.delete(key)
+    return accepted
+  }, [doSend, isStreamingRef, messagesRef, pendingQueue])
+
+  useEffect(() => {
+    if (
+      contributionWasActiveRef.current
+      && !turnActive
+      && pendingQueue.pendingMessagesRef.current.length === 0
+    ) {
+      contributionIntentClaimsRef.current.clear()
+    }
+    contributionWasActiveRef.current = turnActive
+  }, [turnActive, pendingQueue.pendingMessagesRef, pendingQueue.visiblePendingMessages])
+
+  const handlePrepareChatChanges = useCallback((revision = '') => {
     setShowChanges(false)
-    const submission = chatContributionPrepareSubmission()
-    void doSend(submission.text, submission.options)
-  }, [doSend])
+    void sendContributionIntent(
+      `prepare:${revision || CHAT_CONTRIBUTION_PREPARE_PROMPT}`,
+      CHAT_CONTRIBUTION_PREPARE_PROMPT,
+    )
+  }, [sendContributionIntent])
+
+  const handlePrepareProjectChanges = useCallback((source, revision = '') => {
+    setShowChanges(false)
+    const prompt = projectContributionPreparePrompt(source)
+    void sendContributionIntent(
+      `prepare-project:${source?.id || ''}:${revision || prompt}`,
+      prompt,
+    )
+  }, [sendContributionIntent])
+
+  const handleContributeAll = useCallback((revision = '') => {
+    setShowChanges(false)
+    void sendContributionIntent(
+      `finish:${revision || CHAT_CONTRIBUTION_FINISH_PROMPT}`,
+      CHAT_CONTRIBUTION_FINISH_PROMPT,
+    )
+  }, [sendContributionIntent])
+
+  const handleCheckContributionUpdates = useCallback((records) => {
+    setShowChanges(false)
+    const prompt = openContributionUpdatePrompt(records)
+    const revision = (Array.isArray(records) ? records : [records])
+      .map(record => reviewActionKey(record))
+      .sort()
+      .join('|')
+    void sendContributionIntent(`updates:${revision || prompt}`, prompt)
+  }, [sendContributionIntent])
+
+  const handleOpenChanges = useCallback((returnFocus = null) => {
+    changesReturnFocusRef.current = returnFocus || document.activeElement
+    setShowChanges(true)
+  }, [])
 
   const handleContributionFollowup = useCallback((record) => {
     setShowChanges(false)
-    void doSend(contributionFollowupPrompt(record), {
-      attachments: [],
-      preserveComposer: true,
-    })
-  }, [doSend])
+    const prompt = contributionFollowupPrompt(record)
+    void sendContributionIntent(`followup:${reviewActionKey(record)}`, prompt)
+  }, [sendContributionIntent])
 
   useOpenAppCtaAutoDismiss({
     builtApps,
@@ -4656,8 +4733,12 @@ export default function ChatView({
           initialEntries={chatDiffEntries}
           onClose={() => setShowChanges(false)}
           onPrepareChanges={handlePrepareChatChanges}
+          onPrepareProject={handlePrepareProjectChanges}
+          onContributeAll={handleContributeAll}
+          onCheckUpdates={handleCheckContributionUpdates}
           onOpenApp={onOpenApp}
           onContinueInChat={handleContributionFollowup}
+          returnFocusRef={changesReturnFocusRef}
           turnActive={turnActive}
         />
       )}
@@ -4993,8 +5074,9 @@ export default function ChatView({
               initialChangeEntries={chatDiffEntries}
               onOpenApp={onOpenApp}
               onContinueInChat={handleContributionFollowup}
-              onOpenChanges={() => setShowChanges(true)}
+              onOpenChanges={handleOpenChanges}
               onPrepareChanges={handlePrepareChatChanges}
+              onContributeAll={handleContributeAll}
               onOpenChat={(targetChatId) => {
                 if (!internalNav || !targetChatId) return
                 internalNav(new URL(
@@ -5108,7 +5190,7 @@ export default function ChatView({
                 modelSelectionRequest={modelSelectionRequest}
                 onOpenInspector={() => setShowInspector(true)}
                 onOpenSummary={() => setShowSummary(true)}
-                onOpenChanges={() => setShowChanges(true)}
+                onOpenChanges={handleOpenChanges}
                 artifactsAppId={artifactsAppId}
                 onOpenArtifact={onOpenArtifact}
                 onOpenUsage={() => setShowUsage(true)}

@@ -256,6 +256,26 @@
   line-height: 1.4;
 }
 
+.contrib-card-stack__confirm {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+
+.contrib-card-stack__confirm > strong {
+  color: var(--text);
+  font-size: 0.875rem;
+  line-height: 1.3;
+}
+
+.contrib-card-stack__confirm > span {
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
 @media (max-width: 560px) {
   .contrib-card-stack {
     width: 100%;

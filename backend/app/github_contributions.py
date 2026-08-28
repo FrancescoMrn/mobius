@@ -544,8 +544,18 @@ def _stack_meta(record: dict) -> dict:
   }
 
 
-def _validate_stack_records(records: list[dict]) -> list[dict]:
-  """Validate one complete, immutable parent-to-child contribution chain."""
+def _validate_stack_records(
+  records: list[dict],
+  *,
+  allowed_actions: frozenset[str] = frozenset({"pr"}),
+) -> list[dict]:
+  """Validate one complete, immutable parent-to-child contribution chain.
+
+  Publishing a new stack keeps the narrow ``pr`` default. Read-only review
+  callers may additionally admit ``pr_update`` so an already-public stack can
+  be re-reviewed layer by layer without making the stack submit endpoint a
+  second, less-specific update path.
+  """
   if not records:
     raise ContributionSubmitError("This PR stack has no reviewed records.")
   decorated = [(record, _stack_meta(record)) for record in records]
@@ -584,7 +594,7 @@ def _validate_stack_records(records: list[dict]) -> list[dict]:
     branches.add(branch)
     if meta["id"] != stack_id or meta["total"] != total:
       raise ContributionSubmitError("These records do not describe one PR stack.")
-    if record.get("type") != "pr" or plan.get("action") != "pr":
+    if record.get("type") != "pr" or plan.get("action") not in allowed_actions:
       raise ContributionSubmitError("PR stacks can contain pull requests only.")
     if record.get("status") not in allowed_statuses:
       raise ContributionSubmitError(
@@ -630,6 +640,9 @@ def _claim_stack_records(
   record_ids: list[str],
   db: Session,
   expected_nonce: str | None,
+  allowed_actions: frozenset[str] = frozenset({"pr"}),
+  submitter: str = "contribute-stack-button",
+  already_detail: str = "Every PR in this stack has already been submitted.",
 ) -> list[dict]:
   if not 2 <= len(record_ids) <= 12 or len(set(record_ids)) != len(record_ids):
     raise HTTPException(
@@ -649,7 +662,10 @@ def _claim_stack_records(
       "diff_path": diff_path,
     })
   try:
-    validated = _validate_stack_records([row["record"] for row in rows])
+    validated = _validate_stack_records(
+      [row["record"] for row in rows],
+      allowed_actions=allowed_actions,
+    )
   except ContributionSubmitError as exc:
     raise HTTPException(status_code=409, detail=exc.message) from exc
   by_id = {row["record"]["id"]: row for row in rows}
@@ -662,7 +678,7 @@ def _claim_stack_records(
       record = {
         **record,
         "status": "submitting",
-        "submitter": "contribute-stack-button",
+        "submitter": submitter,
         "submit_started_at": now,
         "updated_at": now,
       }
@@ -671,7 +687,7 @@ def _claim_stack_records(
   if not any(row["record"].get("status") == "submitting" for row in ordered):
     raise HTTPException(
       status_code=409,
-      detail="Every PR in this stack has already been submitted.",
+      detail=already_detail,
     )
   return ordered
 
@@ -960,6 +976,7 @@ def _mark_submit_failure(
   record_path: Path,
   message: str,
   record_patch: dict | None = None,
+  code: str = "",
   detail: str = "",
 ) -> dict | None:
   try:
@@ -981,6 +998,10 @@ def _mark_submit_failure(
     next_record["last_submit_error_detail"] = detail
   else:
     next_record.pop("last_submit_error_detail", None)
+  if code:
+    next_record["last_submit_error_code"] = code
+  else:
+    next_record.pop("last_submit_error_code", None)
   _write_record(record_path, next_record)
   return next_record
 
@@ -1047,6 +1068,7 @@ def _mark_stack_submit_failure(
   *,
   failed_id: str | None = None,
   record_patch: dict | None = None,
+  code: str = "",
   detail: str = "",
 ) -> list[dict]:
   snapshots = []
@@ -1060,6 +1082,7 @@ def _mark_stack_submit_failure(
         record_path=row["record_path"],
         message=message,
         record_patch=patch,
+        code=code if is_failed else "",
         # Only the layer that actually failed owns the transcript; the
         # siblings were stopped, not rejected.
         detail=detail if is_failed else "",
