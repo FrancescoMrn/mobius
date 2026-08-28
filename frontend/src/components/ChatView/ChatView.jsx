@@ -63,6 +63,10 @@ import ActiveAssistantSurface from './ActiveAssistantSurface.jsx'
 import QueuedMessages from './QueuedMessages.jsx'
 import ContributionReviewCard from './ContributionReviewCard.jsx'
 import {
+  chatChangesActionIsCurrent,
+  refreshChatChangesOverview,
+} from './chatChangesQueries.js'
+import {
   contributionFollowupPrompt,
   reviewActionKey,
 } from './contributionReviewModel.js'
@@ -4027,9 +4031,27 @@ export default function ChatView({
   const contributionIntentClaimsRef = useRef(new Set())
   const contributionWasActiveRef = useRef(turnActive)
 
-  const sendContributionIntent = useCallback(async (key, prompt) => {
+  const refreshContributionOverview = useCallback(() => (
+    refreshChatChangesOverview({
+      queryClient,
+      apps: builtApps,
+      chatId,
+    })
+  ), [builtApps, chatId, queryClient])
+
+  const sendContributionIntent = useCallback(async (key, prompt, action = null) => {
     if (!key || contributionIntentClaimsRef.current.has(key)) return false
     contributionIntentClaimsRef.current.add(key)
+    if (action) {
+      const overview = await refreshContributionOverview()
+      // A confirmed newer lifecycle supersedes the stale control. If the
+      // refresh itself is unavailable, preserve the owner's intent: the
+      // contribution agent still performs its own authoritative recheck.
+      if (overview && !chatChangesActionIsCurrent(overview, action)) {
+        contributionIntentClaimsRef.current.delete(key)
+        return false
+      }
+    }
     await doSend(prompt, { attachments: [], preserveComposer: true })
     const promptPresent = [
       ...(pendingQueue.pendingMessagesRef.current || []),
@@ -4042,7 +4064,7 @@ export default function ChatView({
       || isStreamingRef.current || serverRunningRef.current
     if (!accepted) contributionIntentClaimsRef.current.delete(key)
     return accepted
-  }, [doSend, isStreamingRef, messagesRef, pendingQueue])
+  }, [doSend, isStreamingRef, messagesRef, pendingQueue, refreshContributionOverview])
 
   useEffect(() => {
     if (
@@ -4060,6 +4082,7 @@ export default function ChatView({
     void sendContributionIntent(
       `prepare:${revision || CHAT_CONTRIBUTION_PREPARE_PROMPT}`,
       CHAT_CONTRIBUTION_PREPARE_PROMPT,
+      revision ? { kind: 'unsorted', revision } : null,
     )
   }, [sendContributionIntent])
 
@@ -4069,6 +4092,7 @@ export default function ChatView({
     void sendContributionIntent(
       `prepare-project:${source?.id || ''}:${revision || prompt}`,
       prompt,
+      revision ? { kind: 'unsorted', revision } : null,
     )
   }, [sendContributionIntent])
 
@@ -4077,6 +4101,7 @@ export default function ChatView({
     void sendContributionIntent(
       `finish:${revision || CHAT_CONTRIBUTION_FINISH_PROMPT}`,
       CHAT_CONTRIBUTION_FINISH_PROMPT,
+      revision ? { kind: 'workflow', revision } : null,
     )
   }, [sendContributionIntent])
 
@@ -4087,7 +4112,11 @@ export default function ChatView({
       .map(record => reviewActionKey(record))
       .sort()
       .join('|')
-    void sendContributionIntent(`updates:${revision || prompt}`, prompt)
+    void sendContributionIntent(
+      `updates:${revision || prompt}`,
+      prompt,
+      revision ? { kind: 'records', recordKeys: revision.split('|') } : null,
+    )
   }, [sendContributionIntent])
 
   const handleOpenChanges = useCallback((returnFocus = null) => {
@@ -4098,7 +4127,12 @@ export default function ChatView({
   const handleContributionFollowup = useCallback((record) => {
     setShowChanges(false)
     const prompt = contributionFollowupPrompt(record)
-    void sendContributionIntent(`followup:${reviewActionKey(record)}`, prompt)
+    const revision = reviewActionKey(record)
+    void sendContributionIntent(
+      `followup:${revision}`,
+      prompt,
+      revision ? { kind: 'records', recordKeys: [revision] } : null,
+    )
   }, [sendContributionIntent])
 
   useOpenAppCtaAutoDismiss({

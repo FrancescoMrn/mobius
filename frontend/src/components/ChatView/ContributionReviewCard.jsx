@@ -80,13 +80,11 @@ export default function ContributionReviewCard({
   const wasActive = useRef(turnActive)
   useEffect(() => {
     if (wasActive.current && !turnActive) {
-      void queryClient.invalidateQueries({ queryKey, exact: true }).finally(() => {
-        acceptedRef.current = new Set()
-        setAccepted(new Set())
-      })
+      acceptedRef.current = new Set()
+      setAccepted(new Set())
     }
     wasActive.current = turnActive
-  }, [turnActive, queryClient, queryKey])
+  }, [turnActive])
 
   const unsortedItem = {
     kind: 'unsorted',

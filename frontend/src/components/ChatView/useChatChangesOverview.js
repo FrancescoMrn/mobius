@@ -2,7 +2,6 @@
 
 import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { api, apiFetch } from '../../api/client.js'
 import { appQueries } from '../../hooks/queries.js'
 import {
   contributeApp,
@@ -11,26 +10,25 @@ import {
 import {
   chatChangesOverview,
 } from './chatChangesLifecycle.js'
+import { mergeChatDiffEntries } from './chatDiffs.js'
 import {
-  mergeChatDiffEntries,
-  normalizeChatDiffEntries,
-} from './chatDiffs.js'
+  chatEditDiffsQueryOptions,
+  contributionsForChatQueryOptions,
+  contributionsForChatQueryKey,
+} from './chatChangesQueries.js'
 
 export function useChatContributions(chatId, { enabled = true } = {}) {
   const appsQuery = appQueries.list.useQuery()
   const appId = contributeAppId(appsQuery.data)
   const app = contributeApp(appsQuery.data, appId)
   const queryKey = useMemo(
-    () => ['contributions-for-chat', appId, chatId],
+    () => contributionsForChatQueryKey(appId, chatId),
     [appId, chatId],
   )
   const query = useQuery({
+    ...contributionsForChatQueryOptions(appId, chatId),
     queryKey,
-    queryFn: () => api.contributions.forChat(appId, chatId)
-      .then(response => (response.ok ? response.json() : null)),
     enabled: Boolean(enabled && appId && chatId),
-    staleTime: 15000,
-    retry: false,
   })
   return { appId, app, queryKey, ...query }
 }
@@ -38,19 +36,8 @@ export function useChatContributions(chatId, { enabled = true } = {}) {
 export function useChatChangesOverview(chatId, initialEntries = [], { enabled = true } = {}) {
   const contributions = useChatContributions(chatId, { enabled })
   const diffs = useQuery({
-    queryKey: ['chat-edit-diffs', String(chatId || '')],
-    queryFn: async ({ signal }) => {
-      const response = await apiFetch(
-        `/chats/${encodeURIComponent(chatId)}/edit-diffs`,
-        { signal },
-      )
-      if (!response.ok) throw new Error(`Request failed (${response.status})`)
-      const data = await response.json()
-      return normalizeChatDiffEntries(data?.entries)
-    },
+    ...chatEditDiffsQueryOptions(chatId),
     enabled: Boolean(enabled && chatId),
-    staleTime: 15000,
-    retry: false,
   })
   const entries = useMemo(
     () => mergeChatDiffEntries(diffs.data || [], initialEntries),

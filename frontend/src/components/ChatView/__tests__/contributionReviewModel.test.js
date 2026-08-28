@@ -231,6 +231,16 @@ test('failed publication becomes a calm recovery action, not another blind send'
   assert.match(cardSrc, /onOpenApp\(contributeApp, \{ final: true, intent \}\)[\s\S]*onDismiss\(\)/)
 })
 
+test('agent contribution intents refresh their lifecycle before sending', () => {
+  assert.match(
+    chatViewSrc,
+    /const overview = await refreshContributionOverview\(\)[\s\S]*?overview && !chatChangesActionIsCurrent\(overview, action\)[\s\S]*?await doSend\(prompt/,
+  )
+  assert.match(chatViewSrc, /kind: 'unsorted', revision/)
+  assert.match(chatViewSrc, /kind: 'workflow', revision/)
+  assert.match(chatViewSrc, /kind: 'records', recordKeys/)
+})
+
 test('existing review runtime becomes one unambiguous continuation state', () => {
   assert.equal(contributionReviewRunPhase({ running: true }), 'running')
   assert.equal(contributionReviewRunPhase({ pending_question_id: 'q1' }), 'waiting')
@@ -434,7 +444,10 @@ test('healthy sent records leave chat while attention can hand work back to the 
   assert.match(cardSrc, />\s*Ask agent to fix\s*</)
   assert.doesNotMatch(cardSrc, /Queue agent follow-up/)
   assert.match(cardSrc, /acceptedRef\.current\.has\(key\)/)
-  assert.match(chatViewSrc, /sendContributionIntent\(`followup:\$\{reviewActionKey\(record\)\}`/)
+  assert.match(
+    chatViewSrc,
+    /const revision = reviewActionKey\(record\)[\s\S]*?sendContributionIntent\([\s\S]*?`followup:\$\{revision\}`/,
+  )
   assert.match(chatViewSrc, /onContinueInChat=\{handleContributionFollowup\}/)
   assert.match(publicationSrc, /publication\?\.record\?\.status === 'draft'/)
 })

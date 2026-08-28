@@ -41,6 +41,7 @@ import {
 } from '../../hooks/queries.js'
 import { immersiveReducer, isImmersiveActive } from '../../lib/immersive.js'
 import { bumpChatRunSignal, chatRunSignal } from '../../lib/chatRunSignal.js'
+import { invalidateChatChangesQueries } from '../ChatView/chatChangesQueries.js'
 import { clearAppFrameStorage, clearCachedAppToken } from '../../lib/appFrameStorage.js'
 import * as tabModel from './tabModel.js'
 import * as paneModel from './paneModel.js'
@@ -2602,6 +2603,10 @@ export default function Shell({ onInitialVisualReady }) {
         markChatRunFinished(chatId)
         markStreamingEnd(chatId)
         markChatRunState(chatId, false)
+        // Chat edits and their contribution ledger can both settle during an
+        // agent turn. Completion is the shared freshness boundary even when
+        // the chat card was hidden or unmounted while that work ran.
+        void invalidateChatChangesQueries(queryClient, chatId)
         markChatOwnerInput(chatId, { kind: null, questionId: null })
         // Attention iff the finished chat is NOT visible in ANY pane — membership
         // in the visible set, not equality with one global id, so a chat visible
