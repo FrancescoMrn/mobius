@@ -20,6 +20,7 @@ import {
 import {
   autopilotOnSend,
   contributionReviewIntent,
+  currentReviewItems,
   publicationAction,
   publicationFailureOwner,
   publicationItemsAction,
@@ -123,6 +124,8 @@ export default function ChatDiffViewer({
   const [accepted, setAccepted] = useState(() => new Set())
   const [failures, setFailures] = useState({})
   const [confirming, setConfirming] = useState(null)
+  const [publishPhase, setPublishPhase] = useState(null)
+  const publishInFlightRef = useRef(false)
 
   useDialogFocus({
     containerRef: dialogRef,
@@ -274,17 +277,35 @@ export default function ChatDiffViewer({
   }
 
   async function publishBatch(items) {
-    setConfirming(null)
+    if (publishInFlightRef.current) return
+    publishInFlightRef.current = true
+    setPublishPhase('checking')
+    const refreshed = await overview.contributionsQuery.refetch().catch(() => null)
+    const current = refreshed?.data
+      ? currentReviewItems(items, refreshed.data)
+      : items
+    if (!current) {
+      setConfirming(null)
+      setPublishPhase(null)
+      publishInFlightRef.current = false
+      return
+    }
+    setPublishPhase('publishing')
     const outcomes = []
-    for (const item of items) {
+    for (const item of current) {
       outcomes.push(item.kind === 'stack'
         ? await publishStack(item)
         : await publish(item.record))
     }
     if (outcomes.some(outcome => outcome?.recover)) {
-      onContributeAll?.(overview.workflowRevision)
+      // The requests above already reconciled the ledger. One batch has one
+      // recovery intent, based on current state rather than the stale click.
+      onContributeAll?.()
       onClose?.()
     }
+    setConfirming(null)
+    setPublishPhase(null)
+    publishInFlightRef.current = false
   }
 
   const latestUnsortedTime = overview.unsortedEntries.reduce((latest, entry) => (
@@ -469,7 +490,7 @@ export default function ChatDiffViewer({
                         </button>
                       ) : activeStage === 'prepared' && !blocker ? (
                         <>
-                          <button type="button" className="is-primary" onClick={() => setConfirming([record])}>{action.label}</button>
+                          <button type="button" className="is-primary" onClick={() => setConfirming([{ kind: 'record', id: record.id, record }])}>{action.label}</button>
                           <button type="button" onClick={() => openContribute(record)}>Review</button>
                         </>
                       ) : activeStage === 'prepared' ? (
@@ -504,9 +525,13 @@ export default function ChatDiffViewer({
               <span>GitHub will receive only these exact reviewed heads. Nothing will be merged.</span>
             </div>
             <div>
-              <button type="button" onClick={() => setConfirming(null)}>Keep private</button>
-              <button type="button" className="is-primary" onClick={() => publishBatch(confirming)}>
-                {confirmingAction.confirmLabel}
+              <button type="button" disabled={Boolean(publishPhase)} onClick={() => setConfirming(null)}>Keep private</button>
+              <button type="button" className="is-primary" disabled={Boolean(publishPhase)} onClick={() => publishBatch(confirming)}>
+                {publishPhase === 'checking'
+                  ? 'Checking…'
+                  : publishPhase === 'publishing'
+                    ? confirmingAction.updating ? 'Updating…' : 'Sending…'
+                    : confirmingAction.confirmLabel}
               </button>
             </div>
           </div>

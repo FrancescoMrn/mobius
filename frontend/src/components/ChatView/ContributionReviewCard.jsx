@@ -8,6 +8,7 @@ import {
   autopilotOnSend,
   contributionRecoveryAction,
   contributionReviewIntent,
+  currentReviewItems,
   diffStatSummary,
   isTrackingRecord,
   isHorizontalSwipe,
@@ -75,6 +76,8 @@ export default function ContributionReviewCard({
   const acceptedRef = useRef(new Set())
   const [actionFailures, setActionFailures] = useState({})
   const [confirmingItems, setConfirmingItems] = useState(null)
+  const [batchPhase, setBatchPhase] = useState(null)
+  const batchInFlightRef = useRef(false)
   const storage = typeof localStorage !== 'undefined' ? localStorage : null
 
   const wasActive = useRef(turnActive)
@@ -103,6 +106,7 @@ export default function ContributionReviewCard({
   const groupDefault = reviewGroupDefault(pendingItems, {
     connected: data?.connected !== false,
   })
+  const groupNeedsAgent = groupDefault?.kind !== 'publish-items'
   void dismissRevision
   if (!appId || panel.count === 0) return null
 
@@ -148,7 +152,7 @@ export default function ContributionReviewCard({
     }
   }
 
-  async function publishItem(item) {
+  async function publishItem(item, { deferRecovery = false } = {}) {
     const record = item.record
     if (!record) return
     if (!consume(item)) return
@@ -163,15 +167,17 @@ export default function ContributionReviewCard({
       queryClient.setQueryData(queryKey, current => (
         projectPublishedContribution(current, record.id, outcome.publication)
       ))
-      return
+      return outcome
     }
-    if (outcome.kind === 'reconciled') return
+    if (outcome.kind === 'reconciled') return outcome
 
     if (publicationFailureOwner(outcome.failure) === 'agent') {
+      if (deferRecovery) return { ...outcome, needsRecovery: true }
       const started = await startRecovery(outcome.record)
-      if (started) return
+      if (started) return { ...outcome, recoveryStarted: true }
     }
     release(item, outcome.failure)
+    return outcome
   }
 
   async function fixItem(item) {
@@ -186,7 +192,7 @@ export default function ContributionReviewCard({
     }
   }
 
-  async function publishStackItem(item) {
+  async function publishStackItem(item, { deferRecovery = false } = {}) {
     if (!consume(item)) return
     setActionFailures(current => ({ ...current, [item.id]: null }))
     const outcome = await publishContributionStack({
@@ -194,22 +200,57 @@ export default function ContributionReviewCard({
       item,
       refetch: contributionsQuery.refetch,
     })
-    if (outcome.kind === 'published' || outcome.kind === 'reconciled') return
+    if (outcome.kind === 'published' || outcome.kind === 'reconciled') return outcome
     if (publicationFailureOwner(outcome.failure) === 'agent'
       && typeof onContributeAll === 'function') {
-      onContributeAll(overview.workflowRevision)
-      return
+      if (deferRecovery) return { ...outcome, needsRecovery: true }
+      // The failed request already reconciled the ledger. Do not send the
+      // obsolete pre-click revision back through the freshness guard.
+      onContributeAll()
+      return { ...outcome, recoveryStarted: true }
     }
     release(item, outcome.failure)
+    return outcome
   }
 
   async function publishConfirmedItems() {
+    if (batchInFlightRef.current) return
     const snapshot = Array.isArray(confirmingItems) ? confirmingItems : []
-    setConfirmingItems(null)
-    for (const item of snapshot) {
-      if (item.kind === 'stack') await publishStackItem(item)
-      else await publishItem(item)
+    if (snapshot.length === 0) return
+    batchInFlightRef.current = true
+    setBatchPhase('checking')
+    const refreshed = await contributionsQuery.refetch().catch(() => null)
+    const current = refreshed?.data
+      ? currentReviewItems(snapshot, refreshed.data)
+      : snapshot
+    if (!current) {
+      setConfirmingItems(null)
+      setBatchPhase(null)
+      batchInFlightRef.current = false
+      return
     }
+    setBatchPhase('publishing')
+    const outcomes = []
+    for (const item of current) {
+      outcomes.push(item.kind === 'stack'
+        ? await publishStackItem(item, { deferRecovery: true })
+        : await publishItem(item, { deferRecovery: true }))
+    }
+    const recoveries = outcomes
+      .map((outcome, index) => outcome?.needsRecovery ? [current[index], outcome] : null)
+      .filter(Boolean)
+    if (recoveries.length > 0) {
+      if (typeof onContributeAll === 'function') {
+        // One batch intent owns one recovery, even when several stack requests
+        // report the same stale or transient failure.
+        onContributeAll()
+      } else {
+        recoveries.forEach(([item, outcome]) => release(item, outcome.failure))
+      }
+    }
+    setConfirmingItems(null)
+    setBatchPhase(null)
+    batchInFlightRef.current = false
   }
 
   function acceptPrivate(item, callback) {
@@ -219,7 +260,7 @@ export default function ContributionReviewCard({
   }
 
   async function runGroupDefault() {
-    if (!groupDefault) return
+    if (!groupDefault || batchInFlightRef.current) return
     if (groupDefault.kind === 'contribute') {
       if (typeof onContributeAll !== 'function') return
       const direct = pendingItems.filter(item => (
@@ -244,6 +285,19 @@ export default function ContributionReviewCard({
     }
   }
 
+  function dismissAll() {
+    if (batchInFlightRef.current) return
+    setConfirmingItems(null)
+    for (const item of pendingItems) {
+      if (item.kind === 'unsorted') {
+        rememberUnsortedDismissed(chatId, overview.unsortedRevision, storage)
+      } else {
+        rememberReviewItemDismissed(item, storage)
+      }
+    }
+    setDismissRevision(value => value + 1)
+  }
+
   return (
     <div
       className={`contrib-card-stack${grouped ? ' contrib-card-stack--grouped' : ''}`}
@@ -252,19 +306,31 @@ export default function ContributionReviewCard({
     >
       {grouped ? (
         <div className="contrib-card-stack__heading">
-          <div>
+          <div className="contrib-card-stack__heading-copy">
             <div className="contrib-card-stack__title">{panel.title}</div>
             <div className="contrib-card-stack__copy">{panel.copy}</div>
           </div>
-          {groupDefault ? (
+          <div className="contrib-card-stack__heading-actions">
+            {groupDefault ? (
+              <button
+                type="button"
+                className="contrib-card-stack__default"
+                disabled={Boolean(batchPhase) || (turnActive && groupNeedsAgent)}
+                onClick={runGroupDefault}
+              >
+                {groupDefault.label}
+              </button>
+            ) : null}
             <button
               type="button"
-              className="contrib-card-stack__default"
-              onClick={runGroupDefault}
+              className="contrib-card-stack__dismiss-all"
+              disabled={Boolean(batchPhase)}
+              aria-label="Dismiss all — keeps the work in Changes and Contribute"
+              onClick={dismissAll}
             >
-              {groupDefault.label}
+              <X width={16} height={16} aria-hidden="true" />
             </button>
-          ) : null}
+          </div>
         </div>
       ) : null}
       {pendingItems.map(item => {
@@ -305,7 +371,7 @@ export default function ContributionReviewCard({
               failure={actionFailures[item.id]}
               onPublish={() => setConfirmingItems([item])}
               onOpenContribute={onOpenContribute}
-              onStartAgent={() => acceptPrivate(item, () => onContributeAll?.(overview.workflowRevision))}
+              onStartAgent={turnActive ? null : () => acceptPrivate(item, () => onContributeAll?.(overview.workflowRevision))}
               onDismiss={onDismiss}
             />
           )
@@ -316,7 +382,7 @@ export default function ContributionReviewCard({
             <TrackingRow
               key={itemRevision(item)}
               record={record}
-              onContinueInChat={() => acceptPrivate(item, () => onContinueInChat?.(record))}
+              onContinueInChat={turnActive ? null : () => acceptPrivate(item, () => onContinueInChat?.(record))}
               onDismiss={onDismiss}
             />
           )
@@ -327,7 +393,7 @@ export default function ContributionReviewCard({
             record={record}
             connected={data?.connected !== false}
             onPublish={() => publishItem(item)}
-            onFix={() => fixItem(item)}
+            onFix={turnActive ? null : () => fixItem(item)}
             onOpenContribute={onOpenContribute}
             onDismiss={onDismiss}
             failure={actionFailures[record.id]}
@@ -337,6 +403,7 @@ export default function ContributionReviewCard({
       {confirmingItems ? (
         <StackPublicationConfirmation
           items={confirmingItems}
+          phase={batchPhase}
           onCancel={() => setConfirmingItems(null)}
           onConfirm={publishConfirmedItems}
         />
@@ -538,8 +605,12 @@ function StackReviewRow({
   )
 }
 
-function StackPublicationConfirmation({ items, onCancel, onConfirm }) {
+function StackPublicationConfirmation({ items, phase, onCancel, onConfirm }) {
   const action = publicationItemsAction(items)
+  const busy = Boolean(phase)
+  const busyLabel = phase === 'checking'
+    ? 'Checking…'
+    : action.updating ? 'Updating…' : 'Sending…'
   return (
     <div
       className="contrib-card-stack__confirm"
@@ -549,9 +620,9 @@ function StackPublicationConfirmation({ items, onCancel, onConfirm }) {
       <strong>{action.promptLabel}</strong>
       <span>GitHub will receive only these exact reviewed heads. Nothing is merged.</span>
       <div className="contrib-card__actions">
-        <button type="button" className="contrib-card__review" onClick={onCancel}>Keep private</button>
-        <button type="button" className="contrib-card__send" onClick={onConfirm}>
-          {action.confirmLabel}
+        <button type="button" className="contrib-card__review" disabled={busy} onClick={onCancel}>Keep private</button>
+        <button type="button" className="contrib-card__send" disabled={busy} onClick={onConfirm}>
+          {busy ? busyLabel : action.confirmLabel}
         </button>
       </div>
     </div>

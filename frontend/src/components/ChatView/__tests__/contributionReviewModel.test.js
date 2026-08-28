@@ -17,6 +17,7 @@ import {
   contributionRecoveryDraft,
   contributionReviewRunPhase,
   contributionReviewIntent,
+  currentReviewItems,
   diffStatSummary,
   dismissKey,
   isDismissed,
@@ -45,10 +46,11 @@ import {
 } from '../contributionReviewModel.js'
 
 const cardSrc = readFileSync(new URL('../ContributionReviewCard.jsx', import.meta.url), 'utf8')
+const changesSrc = readFileSync(new URL('../ChatDiffViewer.jsx', import.meta.url), 'utf8')
+const chatViewSrc = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 const publicationSrc = readFileSync(new URL('../chatContributionPublication.js', import.meta.url), 'utf8')
 const clientSrc = readFileSync(new URL('../../../api/client.js', import.meta.url), 'utf8')
 const cardCss = readFileSync(new URL('../ContributionReviewCard.css', import.meta.url), 'utf8')
-const chatViewSrc = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 
 const APPS = [
   { id: 3, slug: 'some-other-app' },
@@ -404,7 +406,7 @@ test('grouped cards expose one safe default for the exact visible set', () => {
     ready('one'),
     { kind: 'stack', id: 'stack:demo', records: [{ id: 'layer' }] },
   ], { connected: true }), {
-    kind: 'review', intent: 'reviews:queue', label: 'Fix and review all 2',
+    kind: 'review', intent: 'reviews:queue', label: 'Fix and review both',
   })
   assert.deepEqual(reviewGroupDefault([
     ready('one'),
@@ -525,6 +527,23 @@ test('dismissing a stack hides one card and any revised layer brings it back', (
   assert.equal(visibleReviewItems(payload, storage).length, 1)
 })
 
+test('a public confirmation cannot silently switch to a newer reviewed action', () => {
+  const expectedPayload = { records: [
+    { id: 'one', status: 'prepared', action_key: 'review-a' },
+    { id: 'two', status: 'prepared', action_key: 'review-b' },
+  ] }
+  const expected = reviewItems(expectedPayload)
+  const unchanged = currentReviewItems(expected, { records: [
+    { id: 'one', status: 'prepared', action_key: 'review-a', title: 'Fresh copy' },
+    { id: 'two', status: 'prepared', action_key: 'review-b' },
+  ] })
+  assert.equal(unchanged[0].record.title, 'Fresh copy')
+  assert.equal(currentReviewItems(expected, { records: [
+    { id: 'one', status: 'prepared', action_key: 'review-c' },
+    { id: 'two', status: 'prepared', action_key: 'review-b' },
+  ] }), null)
+})
+
 test('dismissal degrades safely without usable storage', () => {
   const record = { id: 'r1', status: 'prepared', updated_at: 'T1' }
   const hostile = {
@@ -543,6 +562,25 @@ test('the swipe has a visible focusable equivalent', () => {
   assert.match(cardSrc, /onClick=\{\(\) => onDismiss\?\.\(\)\}/)
   assert.match(cardSrc, /import \{ X \} from '@openai\/apps-sdk-ui\/components\/Icon'/)
   assert.equal((cardSrc.match(/<X width=\{14\} height=\{14\} aria-hidden="true" \/>/g) || []).length, 4)
+  assert.match(cardSrc, /className="contrib-card-stack__dismiss-all"/)
+  assert.match(cardSrc, /aria-label="Dismiss all — keeps the work in Changes and Contribute"/)
+  assert.match(cardSrc, /for \(const item of pendingItems\)/)
+})
+
+test('batch publication refreshes before GitHub and recovers at most once', () => {
+  assert.match(cardSrc, /setBatchPhase\('checking'\)[\s\S]*contributionsQuery\.refetch\(\)/)
+  assert.match(cardSrc, /if \(batchInFlightRef\.current\) return[\s\S]*batchInFlightRef\.current = true/)
+  assert.match(cardSrc, /currentReviewItems\(snapshot, refreshed\.data\)/)
+  assert.match(cardSrc, /recoveries\.length > 0[\s\S]*onContributeAll\(\)/)
+  assert.match(cardSrc, /phase === 'checking'[\s\S]*'Checking…'/)
+  assert.doesNotMatch(cardSrc, /contrib-card__progress/)
+  assert.match(changesSrc, /currentReviewItems\(items, refreshed\.data\)/)
+  assert.match(changesSrc, /if \(publishInFlightRef\.current\) return[\s\S]*publishInFlightRef\.current = true/)
+  assert.match(changesSrc, /setConfirming\(\[\{ kind: 'record', id: record\.id, record \}\]\)/)
+  assert.match(changesSrc, /outcomes\.some\(outcome => outcome\?\.recover\)[\s\S]*onContributeAll\?\.\(\)/)
+  assert.match(cardSrc, /disabled=\{Boolean\(batchPhase\) \|\| \(turnActive && groupNeedsAgent\)\}/)
+  assert.match(cardSrc, /onStartAgent=\{turnActive \? null/)
+  assert.match(cardSrc, /onContinueInChat=\{turnActive \? null/)
 })
 
 test('the dismissal gesture is claimed with a non-passive touchmove', () => {

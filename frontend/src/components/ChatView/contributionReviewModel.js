@@ -143,8 +143,11 @@ export function stackSendBlocker(item, { connected } = {}) {
     if (typeof record.last_submit_error === 'string' && record.last_submit_error.trim()) {
       return 'This contribution stack needs a fresh check before it can continue.'
     }
-    if (record.quality_review_ready !== true || record.review?.state !== 'ready') {
-      return record.review?.message || 'Finish the exact agent review before sending.'
+    if (record.quality_review_ready !== true) {
+      return 'The agent review is still in progress.'
+    }
+    if (record.review?.state !== 'ready') {
+      return record.review?.message || 'Refresh this review before sending.'
     }
   }
   return null
@@ -394,7 +397,7 @@ export function reviewGroupDefault(items, { connected } = {}) {
   return {
     kind: 'review',
     intent: 'reviews:queue',
-    label: `Fix and review all ${list.length}`,
+    label: list.length === 2 ? 'Fix and review both' : `Fix and review all ${list.length}`,
   }
 }
 
@@ -591,6 +594,27 @@ export function reviewItems(payload) {
     })
   }
   return items
+}
+
+/**
+ * Resolve a cached approval against the latest ledger without silently
+ * changing what the owner approved. A changed record action makes the old
+ * confirmation obsolete, so callers can render the refreshed decision.
+ */
+export function currentReviewItems(expectedItems, payload) {
+  const expected = Array.isArray(expectedItems) ? expectedItems : []
+  const current = new Map(reviewItems(payload).map(item => [item.id, item]))
+  const actionKeys = item => item?.kind === 'stack'
+    ? (item.records || []).map(reviewActionKey).sort()
+    : item?.kind === 'record'
+      ? [reviewActionKey(item.record)]
+      : []
+  const resolved = expected.map(item => current.get(item?.id))
+  if (resolved.some(item => !item)) return null
+  const unchanged = expected.every((item, index) => (
+    actionKeys(item).join('|') === actionKeys(resolved[index]).join('|')
+  ))
+  return unchanged ? resolved : null
 }
 
 function reviewItemDismissIdentity(item) {
