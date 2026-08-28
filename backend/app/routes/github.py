@@ -1228,7 +1228,8 @@ _CHAT_CONTRIBUTION_STATUSES = frozenset({
 
 _CHAT_ID_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SETTLEMENT_SOURCE_PATH = re.compile(
-  r"^/data/(?:platform/|apps/[A-Za-z0-9_.-]+/).+"
+  r"^/data/(?:platform/|apps/[A-Za-z0-9_.-]+/|"
+  r"contrib/[A-Za-z0-9_.-]+/worktree/).+"
 )
 
 

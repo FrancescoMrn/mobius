@@ -5786,6 +5786,33 @@ def test_chat_settlements_are_temporal_idempotent_and_owner_written(
   assert denied.status_code == 403, denied.text
 
 
+def test_chat_settlements_accept_only_review_worktrees_under_contrib(
+  client, owner_token,
+):
+  app_id, _ = _app_token(client, owner_token, github_access=True)
+  headers = {"Authorization": f"Bearer {owner_token}"}
+  url = f"/api/github/contributions/{app_id}/for-chat/chat-a/settle"
+
+  accepted = client.post(url, headers=headers, json={
+    "coverage_at": 1_787_800_000_000,
+    "items": [{
+      "path": "/data/contrib/review-one/worktree/backend/app.py",
+      "disposition": "duplicate",
+      "summary": "Captured by the final review.",
+    }],
+  })
+  assert accepted.status_code == 200, accepted.text
+
+  rejected = client.post(url, headers=headers, json={
+    "coverage_at": 1_787_800_000_000,
+    "items": [{
+      "path": "/data/contrib/review-one/git/config",
+      "disposition": "experimental",
+    }],
+  })
+  assert rejected.status_code == 422, rejected.text
+
+
 def test_chat_action_key_ignores_poll_timestamps_but_changes_with_attention(
   client, owner_token,
 ):
