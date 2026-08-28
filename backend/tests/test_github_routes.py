@@ -29,7 +29,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.responses import Response
 
-from app import github_auth, github_pre_pr_checks, source_status
+from app import github_auth, source_status
 from app.contribution_errors import ContributionSubmitError
 from app.config import get_settings
 from app.database import checked_out_connections
@@ -1313,204 +1313,6 @@ def _prepared_real_review(app_id, record_id):
   return repo, record, diff_text
 
 
-def _prepared_platform_review(app_id, record_id):
-  """Build the supported standalone platform variant of a real review."""
-  repo, record, diff_text = _prepared_real_review(app_id, record_id)
-  record = {
-    **record,
-    "repo": "mobius-os/mobius",
-    "plan": {**record["plan"], "repo": "mobius-os/mobius"},
-  }
-  _write_contribution(app_id, record_id, record, diff_text)
-  return repo, record, diff_text
-
-
-def test_run_pre_pr_checks_persists_exact_run_and_blocks_duplicates(
-  client, owner_token, monkeypatch,
-):
-  _write_token(login="octocat", user_id=42, scopes=("public_repo", "workflow"))
-  app_id, app_token = _app_token(client, owner_token, github_access=True)
-  _repo, _record, _diff = _prepared_platform_review(
-    app_id, "pre-pr-check-success",
-  )
-
-  requested_at = "2026-08-02T14:00:00Z"
-
-  def fake_dispatch(record, diff_path):
-    assert record["pre_pr_checks"]["state"] == "dispatching"
-    assert diff_path.name == "pre-pr-check-success.diff"
-    assert "requested_at" not in record["pre_pr_checks"]
-    return ({
-      "state": "queued",
-      "run_id": 734,
-      "url": "https://github.com/octocat/mobius/actions/runs/734",
-      "fork_repo": "octocat/mobius",
-      "branch": "fix/demo-review",
-      "head_sha": record["plan"]["head_sha"],
-      "workflow": "test.yml",
-      "requested_at": requested_at,
-      "observed_at": requested_at,
-    }, {"last_submit_push_sha": record["plan"]["head_sha"]})
-
-  monkeypatch.setattr(
-    github_pre_pr_checks, "dispatch_pre_pr_checks", fake_dispatch,
-  )
-  headers = {"Authorization": f"Bearer {app_token}"}
-  response = client.post(
-    f"/api/github/contributions/{app_id}/pre-pr-check-success/pre-pr-checks",
-    headers=headers,
-  )
-  assert response.status_code == 200, response.text
-  record = response.json()["record"]
-  assert record["status"] == "prepared"
-  assert record["pre_pr_checks"]["state"] == "queued"
-  assert record["pre_pr_checks"]["run_id"] == 734
-  assert record["pre_pr_checks"]["request_id"]
-  assert record["last_submit_push_sha"] == record["plan"]["head_sha"]
-
-  duplicate = client.post(
-    f"/api/github/contributions/{app_id}/pre-pr-check-success/pre-pr-checks",
-    headers=headers,
-  )
-  assert duplicate.status_code == 409
-  assert "already" in duplicate.json()["detail"].lower()
-
-
-def test_run_pre_pr_checks_keeps_recoverable_failure_on_the_record(
-  client, owner_token, monkeypatch,
-):
-  _write_token(login="octocat", user_id=42, scopes=("public_repo", "workflow"))
-  app_id, app_token = _app_token(client, owner_token, github_access=True)
-  _repo, record, _diff = _prepared_platform_review(
-    app_id, "pre-pr-check-error",
-  )
-
-  requested_at = "2026-08-02T14:00:00Z"
-
-  def fake_dispatch(_record, _diff_path):
-    raise ContributionSubmitError(
-      "GitHub could not start Tests.",
-      status_code=409,
-      code="pre_pr_checks_dispatch_failed",
-      record_patch={
-        "last_submit_push_sha": record["plan"]["head_sha"],
-        "pre_pr_checks": {
-          "state": "error",
-          "message": "GitHub could not start Tests.",
-          "requested_at": requested_at,
-          "observed_at": requested_at,
-        },
-      },
-    )
-
-  monkeypatch.setattr(
-    github_pre_pr_checks, "dispatch_pre_pr_checks", fake_dispatch,
-  )
-  response = client.post(
-    f"/api/github/contributions/{app_id}/pre-pr-check-error/pre-pr-checks",
-    headers={"Authorization": f"Bearer {app_token}"},
-  )
-  assert response.status_code == 409, response.text
-  stored = response.json()["detail"]["record"]
-  assert stored["status"] == "prepared"
-  assert stored["pre_pr_checks"]["state"] == "error"
-  assert stored["pre_pr_checks"]["request_id"]
-  assert stored["last_submit_push_sha"] == record["plan"]["head_sha"]
-
-
-def test_run_pre_pr_checks_settles_an_invalid_checkout_claim(
-  client, owner_token,
-):
-  _write_token(login="octocat", user_id=42, scopes=("public_repo", "workflow"))
-  app_id, app_token = _app_token(client, owner_token, github_access=True)
-  _repo, record, diff_text = _prepared_platform_review(
-    app_id, "pre-pr-check-invalid-path",
-  )
-  record["plan"]["repo_path"] = ""
-  _write_contribution(app_id, "pre-pr-check-invalid-path", record, diff_text)
-
-  response = client.post(
-    f"/api/github/contributions/{app_id}/pre-pr-check-invalid-path/pre-pr-checks",
-    headers={"Authorization": f"Bearer {app_token}"},
-  )
-  assert response.status_code == 409, response.text
-  stored = response.json()["detail"]["record"]
-  assert stored["status"] == "prepared"
-  assert stored["pre_pr_checks"]["state"] == "error"
-  assert "durable repo_path" in stored["pre_pr_checks"]["message"]
-
-
-def test_refresh_pre_pr_checks_persists_the_exact_terminal_run(
-  client, owner_token, monkeypatch,
-):
-  _write_token(login="octocat", user_id=42, scopes=("public_repo", "workflow"))
-  app_id, app_token = _app_token(client, owner_token, github_access=True)
-  _repo, record, diff_text = _prepared_platform_review(
-    app_id, "pre-pr-check-refresh",
-  )
-  record["pre_pr_checks"] = {
-    "state": "in_progress",
-    "request_id": "request-1",
-    "run_id": 735,
-    "url": "https://github.com/octocat/mobius/actions/runs/735",
-    "fork_repo": "octocat/mobius",
-    "branch": record["plan"]["branch"],
-    "head_sha": record["plan"]["head_sha"],
-  }
-  _write_contribution(app_id, "pre-pr-check-refresh", record, diff_text)
-
-  def fake_refresh(_record):
-    return {
-      **_record["pre_pr_checks"],
-      "state": "completed",
-      "conclusion": "success",
-      "completed_at": "2026-08-02T15:00:00Z",
-    }
-
-  monkeypatch.setattr(
-    github_pre_pr_checks, "refresh_pre_pr_check", fake_refresh,
-  )
-  headers = {"Authorization": f"Bearer {app_token}"}
-  url = f"/api/github/contributions/{app_id}/pre-pr-checks/refresh"
-  response = client.post(url, headers=headers)
-  assert response.status_code == 200, response.text
-  assert response.json()["refreshed"][0]["pre_pr_checks"]["conclusion"] == (
-    "success"
-  )
-
-  repeat = client.post(url, headers=headers)
-  assert repeat.status_code == 200
-  assert repeat.json() == {"refreshed": []}
-
-
-def test_send_waits_while_pre_pr_checks_are_active(client, owner_token):
-  _write_token(login="octocat", user_id=42, scopes=("public_repo", "workflow"))
-  app_id, app_token = _app_token(client, owner_token, github_access=True)
-  _repo, record, diff_text = _prepared_platform_review(
-    app_id, "pre-pr-check-send-lock",
-  )
-  record["pre_pr_checks"] = {
-    "state": "queued",
-    "request_id": "request-2",
-    "run_id": 736,
-  }
-  _write_contribution(app_id, "pre-pr-check-send-lock", record, diff_text)
-
-  response = client.post(
-    f"/api/github/contributions/{app_id}/pre-pr-check-send-lock/submit",
-    headers={"Authorization": f"Bearer {app_token}"},
-  )
-  assert response.status_code == 409
-  assert "starting or running" in response.json()["detail"].lower()
-
-  stored = json.loads(
-    (Path(get_settings().data_dir) / "apps" / str(app_id) /
-     "contributions" / "pre-pr-check-send-lock.json").read_text()
-  )
-  assert stored["status"] == "prepared"
-  assert stored["pre_pr_checks"]["state"] == "queued"
-
-
 def test_review_status_catches_local_drift_before_send(
   client, owner_token,
 ):
@@ -1992,9 +1794,6 @@ def test_safe_repo_path_accepts_durable_contribution_roots():
   assert _safe_repo_path(str(data_dir / "platform" / ".worktrees" / "fix")) == (
     data_dir / "platform" / ".worktrees" / "fix"
   ).resolve()
-  assert _safe_repo_path(str(data_dir / "contributions" / "rec" / "repo")) == (
-    data_dir / "contributions" / "rec" / "repo"
-  ).resolve()
   assert _safe_repo_path(str(data_dir / "contrib" / "mobius-fix-x")) == (
     data_dir / "contrib" / "mobius-fix-x"
   ).resolve()
@@ -2012,6 +1811,9 @@ def test_safe_repo_path_rejects_non_durable_locations(tmp_path):
     _safe_repo_path(str(tmp_path / "repo"))
 
   assert "durable contribution folders" in exc.value.message
+
+  with pytest.raises(ContributionSubmitError):
+    _safe_repo_path(str(Path(get_settings().data_dir) / "contributions" / "old"))
   assert "nothing was sent to GitHub" in exc.value.message
 
   data_dir = Path(get_settings().data_dir)
@@ -2635,7 +2437,7 @@ def test_submit_contribution_keeps_accepted_pr_open_on_label_transport_failure(
   _write_token(login="octocat")
   app_id, app_token = _app_token(client, owner_token, github_access=True)
   record_id = f"rec-pr-label-{failure_kind}"
-  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
   (repo / ".git").mkdir(parents=True)
   diff_text = "diff --git a/index.jsx b/index.jsx\n+hello\n"
   base = "b" * 40
@@ -2801,7 +2603,7 @@ def test_submit_contribution_recovers_ambiguous_create_by_exact_pushed_head(
   _write_token(login="octocat")
   app_id, app_token = _app_token(client, owner_token, github_access=True)
   record_id = f"rec-pr-create-{failure_kind}-{existing_mode}"
-  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
   (repo / ".git").mkdir(parents=True)
   diff_text = "diff --git a/index.jsx b/index.jsx\n+hello\n"
   base = "b" * 40
@@ -2956,7 +2758,7 @@ def test_submit_contribution_normalizes_fallback_author_before_push(
   _write_token(login="octocat", user_id=42)
   app_id, _ = _app_token(client, owner_token, github_access=True)
   record_id = "rec-pr-fallback-author"
-  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
   (repo / ".git").mkdir(parents=True)
   diff_text = "diff --git a/index.jsx b/index.jsx\n+hello\n"
   base = "b" * 40
@@ -3084,7 +2886,7 @@ def test_submit_contribution_replaces_stale_fork_remote_before_push(
   _write_token(login="octocat")
   app_id, _ = _app_token(client, owner_token, github_access=True)
   record_id = "rec-pr-stale-fork"
-  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
   (repo / ".git").mkdir(parents=True)
   diff_text = "diff --git a/index.jsx b/index.jsx\n+hello\n"
   base = "b" * 40
@@ -3252,7 +3054,7 @@ def test_submit_contribution_stack_opens_ordered_incremental_prs(
     ),
   ]
   for record_id, position, base_branch, parent_id, base_sha, head_sha, suffix in specs:
-    repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+    repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
     (repo / ".git").mkdir(parents=True)
     diff_text = f"diff --git a/{suffix} b/{suffix}\n+reviewed\n"
     record = {
@@ -3348,7 +3150,7 @@ def test_submit_contribution_stack_preserves_open_parent_when_child_fails(
     ),
   ]
   for record_id, position, base_branch, parent_id, base_sha, head_sha in specs:
-    repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+    repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
     (repo / ".git").mkdir(parents=True)
     branch = f"stack/{stack_id}/0{position}-" + (
       "parent" if position == 1 else "child"
@@ -3494,7 +3296,7 @@ def test_stack_preflight_requires_refresh_after_parent_merges(monkeypatch):
   from app.routes.github import ContributionSubmitError, _preflight_prepared_stack
 
   _write_token(login="octocat")
-  repo = Path(get_settings().data_dir) / "contributions" / "merged-retry" / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / "merged-retry" / "repo"
   (repo / ".git").mkdir(parents=True)
   stack_id = "merged-retry"
   parent_branch = f"stack/{stack_id}/01-parent"
@@ -3559,7 +3361,7 @@ def test_submit_contribution_stack_rejects_broken_parent_link_before_claim(
   stack_id = "broken-chain"
   record_ids = ["broken-01", "broken-02"]
   for position, record_id in enumerate(record_ids, 1):
-    repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+    repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
     (repo / ".git").mkdir(parents=True)
     base_sha = "b" * 40 if position == 1 else "9" * 40
     head_sha = "a" * 40 if position == 1 else "c" * 40
@@ -3624,7 +3426,7 @@ def test_direct_stack_layer_pushes_upstream_and_uses_reviewed_base(
 
   _write_token(login="octocat")
   record_id = "direct-stack-layer"
-  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
   (repo / ".git").mkdir(parents=True)
   branch = "stack/demo-flow/01-model"
   base = "b" * 40
@@ -3935,7 +3737,7 @@ def test_land_contribution_stack_marks_every_layer_merged(
   parent_head = "a" * 40
   top_head = "c" * 40
   for position, record_id in enumerate(record_ids, 1):
-    repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+    repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
     (repo / ".git").mkdir(parents=True)
     branch = f"stack/{stack_id}/0{position}-layer"
     diff_text = f"diff --git a/layer-{position} b/layer-{position}\n+green\n"
@@ -4076,7 +3878,7 @@ def test_land_contribution_stack_restores_open_records_on_preflight_failure(
   stack_id = "red-app-stack"
   ids = ["red-stack-01", "red-stack-02"]
   for position, record_id in enumerate(ids, 1):
-    repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+    repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
     (repo / ".git").mkdir(parents=True)
     parent = "a" * 40
     branch = f"stack/{stack_id}/0{position}-layer"
@@ -4317,7 +4119,7 @@ def test_submit_contribution_rejects_branch_diff_mismatch(
   _write_token(login="octocat")
   app_id, _ = _app_token(client, owner_token, github_access=True)
   record_id = "rec-pr-diff-mismatch"
-  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
   (repo / ".git").mkdir(parents=True)
   reviewed_diff = "diff --git a/index.jsx b/index.jsx\n+reviewed\n"
   branch_diff = "diff --git a/index.jsx b/index.jsx\n+not-reviewed\n"
@@ -4399,7 +4201,7 @@ def test_submit_contribution_rejects_unmergeable_branch_before_push(
   _write_token(login="octocat")
   app_id, _ = _app_token(client, owner_token, github_access=True)
   record_id = "rec-pr-merge-conflict"
-  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
   (repo / ".git").mkdir(parents=True)
   diff_text = "diff --git a/index.jsx b/index.jsx\n+hello\n"
   base = "b" * 40
@@ -4485,7 +4287,7 @@ def test_submit_contribution_records_public_branch_after_pr_create_failure(
   _write_token(login="octocat")
   app_id, _ = _app_token(client, owner_token, github_access=True)
   record_id = "rec-pr-push-then-fail"
-  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
   (repo / ".git").mkdir(parents=True)
   diff_text = "diff --git a/index.jsx b/index.jsx\n+hello\n"
   base = "b" * 40
@@ -4595,7 +4397,7 @@ def test_submit_contribution_rejects_other_app_scoped_token(
       "body_draft": "Body",
       "branch": "fix/demo-polish",
       "repo_path": str(
-        Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+        Path(get_settings().data_dir) / "contrib" / record_id / "repo"
       ),
       "head_sha": "abc123",
     },
@@ -4635,7 +4437,7 @@ def test_submit_contribution_rejects_app_without_github_access(
       "body_draft": "Body",
       "branch": "fix/demo-polish",
       "repo_path": str(
-        Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+        Path(get_settings().data_dir) / "contrib" / record_id / "repo"
       ),
       "head_sha": "abc123",
     },
@@ -6159,7 +5961,7 @@ def test_send_refuses_branch_with_existing_pr_before_any_push(
 
   _write_token(login="octocat")
   record_id = "already-sent-guard"
-  repo = Path(get_settings().data_dir) / "contributions" / record_id / "repo"
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
   (repo / ".git").mkdir(parents=True)
   branch = "stack/demo-flow/01-model"
   base = "b" * 40

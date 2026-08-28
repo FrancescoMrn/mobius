@@ -7,5 +7,5 @@ def test_boot_pruner_preserves_durable_contribution_repositories():
   ).read_text(encoding="utf-8")
 
   assert "! -path '/data/contrib/*'" in script
-  assert "! -path '/data/contributions/*'" in script
+  assert "! -path '/data/contributions/*'" not in script
   assert "prepared review cards point at their exact" in script

@@ -38,7 +38,6 @@ from app.github_contribution_contract import (
   GITHUB_LOGIN as _GITHUB_LOGIN,
   GITHUB_REPO as _GITHUB_REPO,
   GIT_SHA as _GIT_SHA,
-  PRE_PR_CHECK_ACTIVE_STATES as _PRE_PR_CHECK_ACTIVE_STATES,
   SUBMIT_TIMEOUT_SECONDS as _SUBMIT_TIMEOUT,
 )
 from app.contribution_records import (
@@ -120,15 +119,12 @@ def _safe_repo_path(raw: object) -> Path:
   except (OSError, RuntimeError):
     raise ContributionSubmitError("The staged repo path is invalid.")
   data_dir = Path(get_settings().data_dir).resolve()
-  # A durable repo must live under one of these roots so a restart can find it
-  # again. "contrib" is the de-facto staging root the agent prepares work in
-  # (often nested, e.g. contrib/<audit>/<slug>); the plural "contributions" is
-  # kept alongside it for back-compat with older docs that named that form.
+  # A durable repo must live under one of these roots so a restart can find it.
+  # "contrib" is the staging root agents use for private review worktrees.
   allowed_roots = (
     data_dir / "contrib",
     data_dir / "apps",
     data_dir / "platform",
-    data_dir / "contributions",
   )
   for root in allowed_roots:
     try:
@@ -461,18 +457,6 @@ def _claim_record(
     raise HTTPException(
       status_code=409,
       detail="This contribution is no longer waiting for approval.",
-    )
-  pre_pr_checks = record.get("pre_pr_checks")
-  if (
-    isinstance(pre_pr_checks, dict)
-    and pre_pr_checks.get("state") in _PRE_PR_CHECK_ACTIVE_STATES
-  ):
-    raise HTTPException(
-      status_code=409,
-      detail=(
-        "GitHub checks are still starting or running for this review. Wait "
-        "for them to finish before opening the pull request."
-      ),
     )
   plan = record.get("plan")
   if not isinstance(plan, dict):

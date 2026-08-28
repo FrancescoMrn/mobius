@@ -38,15 +38,18 @@ test('one lifecycle separates recorded edits from prepared, open, and settled wo
   ], { records: [
     {
       id: 'prepared', status: 'prepared', source_root: '/data/platform',
-      files: ['a.js'], updated_at: '2026-08-27T10:00:00Z',
+      files: ['a.js'], coverage_at: '2026-08-27T10:00:00Z',
+      updated_at: '2026-08-27T10:00:00Z',
     },
     {
       id: 'open', status: 'open', source_root: '/data/apps/demo',
-      files: ['index.jsx'], updated_at: '2026-08-27T11:00:00Z',
+      files: ['index.jsx'], coverage_at: '2026-08-27T11:00:00Z',
+      updated_at: '2026-08-27T11:00:00Z',
     },
     {
       id: 'settled', status: 'merged', source_root: '/data/platform',
-      files: ['old.js'], updated_at: '2026-08-27T09:00:00Z',
+      files: ['old.js'], coverage_at: '2026-08-27T09:00:00Z',
+      updated_at: '2026-08-27T09:00:00Z',
     },
   ] })
 
@@ -89,19 +92,13 @@ test('repeated edits become one file row while retaining every diff hunk', () =>
   }])
 })
 
-test('coverage uses the exact source root and retains a Möbius fallback for older records', () => {
+test('coverage requires the exact projected source root', () => {
   assert.equal(
     contributionSourceFile({ source_root: '/workspace/project' }, 'src/a.js'),
     '/workspace/project/src/a.js',
   )
-  assert.equal(
-    contributionSourceFile({ repo: 'mobius-os/mobius' }, 'frontend/a.jsx'),
-    '/data/platform/frontend/a.jsx',
-  )
-  assert.equal(
-    contributionSourceFile({ repo: 'mobius-os/app-habits' }, 'index.jsx'),
-    '/data/apps/habits/index.jsx',
-  )
+  assert.equal(contributionSourceFile({ repo: 'mobius-os/mobius' }, 'frontend/a.jsx'), '')
+  assert.equal(contributionSourceFile({ repo: 'mobius-os/app-habits' }, 'index.jsx'), '')
   assert.equal(contributionSourceFile({ repo: 'someone/project' }, 'a.js'), '')
 })
 
@@ -137,6 +134,16 @@ test('an edit made after an old contribution returns to unsorted', () => {
   }] })
 
   assert.deepEqual(overview.unsortedEntries.map(item => item.id), ['newer'])
+  assert.deepEqual(overview.unsortedPaths, ['/data/platform/same.js'])
+})
+
+test('a contribution without a coverage instant cannot hide an edit', () => {
+  const overview = chatChangesOverview([
+    entry('current', '/data/platform/same.js'),
+  ], { records: [{
+    id: 'incomplete', status: 'open', source_root: '/data/platform', files: ['same.js'],
+  }] })
+
   assert.deepEqual(overview.unsortedPaths, ['/data/platform/same.js'])
 })
 

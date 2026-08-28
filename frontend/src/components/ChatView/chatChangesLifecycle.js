@@ -15,15 +15,6 @@ function cleanPath(value) {
   return normalized
 }
 
-function fallbackSourceRoot(record) {
-  const repo = String(record?.repo || '').toLowerCase()
-  if (repo === 'mobius-os/mobius') return '/data/platform'
-  if (repo.startsWith('mobius-os/app-')) {
-    return `/data/apps/${repo.slice('mobius-os/app-'.length)}`
-  }
-  return ''
-}
-
 export function contributionStage(record) {
   if (PREPARED.has(record?.status)) return 'prepared'
   if (OPEN.has(record?.status)) return 'open'
@@ -41,7 +32,7 @@ export function contributionSourceFile(record, file) {
   const path = cleanPath(file)
   if (!path) return ''
   if (path.startsWith('/')) return path
-  const root = cleanPath(record?.source_root) || fallbackSourceRoot(record)
+  const root = cleanPath(record?.source_root)
   return root ? cleanPath(`${root}/${path}`) : ''
 }
 
@@ -82,9 +73,7 @@ function instant(value) {
 function recordCoversEntry(record, entry) {
   const coveredAt = instant(record?.coverage_at)
   const editedAt = instant(entry?.ts)
-  // Old projections and old transcript entries have no ordering signal. Keep
-  // their prior conservative path coverage; every new projection is temporal.
-  return coveredAt === null || editedAt === null || editedAt <= coveredAt
+  return coveredAt !== null && (editedAt === null || editedAt <= coveredAt)
 }
 
 function settlementCoversEntry(settlement, entry) {
