@@ -84,6 +84,14 @@ def read_state(row: models.SharedAppInstance) -> dict:
     return {"values": values, "versions": versions}
 
 
+def read_state_snapshot(db: Session, row: models.SharedAppInstance) -> dict:
+  """Read files and their durable change cursor as one ordered snapshot."""
+  with state_lock(str(row.id)):
+    state = read_state(row)
+    state["cursor"] = list_changes(db, row, None)["cursor"]
+    return state
+
+
 def _append_change(
   db: Session,
   row: models.SharedAppInstance,

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { api, jsonOrThrow } from '../../api/client.js'
 import { projectPreviewSandbox } from '../../lib/projectPreview.js'
+import { normalizeSharedAppSnapshot } from '../../lib/sharedAppState.js'
 
 
 function changedPaths(previous, next) {
@@ -29,16 +30,15 @@ export default function SharedAppFrame({ instanceId, srcDoc, initialState, title
       type: 'mobius:project-preview-storage-changed', path, value,
     }, '*')
     const adopt = next => {
+      const normalized = normalizeSharedAppSnapshot(stateRef.current, next)
+      if (!normalized) return false
       const previous = stateRef.current?.values || {}
-      const values = next?.values || {}
-      stateRef.current = {
-        cursor: Number(next?.cursor ?? stateRef.current?.cursor ?? 0),
-        values,
-        versions: next?.versions || {},
-      }
+      const values = normalized.values
+      stateRef.current = normalized
       for (const path of changedPaths(previous, values)) {
         notify(path, Object.hasOwn(values, path) ? values[path] : null)
       }
+      return true
     }
     const refresh = async () => {
       if (!active || syncing || mutating) return false
@@ -79,7 +79,11 @@ export default function SharedAppFrame({ instanceId, srcDoc, initialState, title
               nextValues[message.path] = message.value
               nextVersions[message.path] = result.version
             }
-            adopt({ values: nextValues, versions: nextVersions })
+            adopt({
+              cursor: result.change_id,
+              values: nextValues,
+              versions: nextVersions,
+            })
             response.value = message.method === 'delete' ? null : message.value
           } finally {
             mutating = false
