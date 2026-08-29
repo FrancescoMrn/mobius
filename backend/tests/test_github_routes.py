@@ -5012,6 +5012,98 @@ def test_existing_pr_stack_update_fast_forwards_complete_chain_parent_first(
   ]
 
 
+def test_existing_pr_stack_update_accepts_unchanged_public_create_parent(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_ids, originals = _prepared_existing_pr_update_stack(app_id)
+  parent = originals[0]
+  parent["status"] = "open"
+  parent["plan"]["action"] = "pr"
+  _write_contribution(
+    app_id,
+    record_ids[0],
+    parent,
+    f"diff --git a/{record_ids[0]} b/{record_ids[0]}\n+reviewed\n",
+  )
+  monkeypatch.setattr(
+    github_routes, "_preflight_prepared_stack", lambda _rows: None,
+  )
+  monkeypatch.setattr(
+    github_routes,
+    "_autopilot_live_target",
+    lambda _repo, number, _head_repo, _branch: {
+      "error": None,
+      "head_sha": "9" * 40,
+      "base_branch": originals[0]["branch"],
+    },
+  )
+  monkeypatch.setattr(
+    github_routes,
+    "_assert_reviewed_update_contains_live_head",
+    lambda *_args: None,
+  )
+  submitted = []
+
+  def submit(record, _diff_path, **_kwargs):
+    submitted.append(record["id"])
+    return (
+      "https://github.com/mobius-os/app-demo/pull/59",
+      59,
+      {"last_submit_push_sha": record["plan"]["head_sha"]},
+    )
+
+  monkeypatch.setattr(github_routes, "_submit_prepared_pr", submit)
+  response = client.post(
+    f"/api/github/contributions/{app_id}/update-stack",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"record_ids": record_ids},
+  )
+
+  assert response.status_code == 200, response.text
+  body = response.json()
+  assert submitted == [record_ids[1]]
+  assert body["updated"] == [{
+    "id": record_ids[1],
+    "url": "https://github.com/mobius-os/app-demo/pull/59",
+    "number": 59,
+  }]
+  assert [record["status"] for record in body["records"]] == ["open", "open"]
+
+
+def test_existing_pr_stack_update_never_claims_private_create_layer(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_ids, originals = _prepared_existing_pr_update_stack(app_id)
+  parent = originals[0]
+  parent["plan"]["action"] = "pr"
+  _write_contribution(
+    app_id,
+    record_ids[0],
+    parent,
+    f"diff --git a/{record_ids[0]} b/{record_ids[0]}\n+reviewed\n",
+  )
+  monkeypatch.setattr(
+    github_routes,
+    "_preflight_prepared_stack",
+    lambda _rows: pytest.fail("an unapproved create layer must not reach preflight"),
+  )
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/update-stack",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"record_ids": record_ids},
+  )
+
+  assert response.status_code == 409, response.text
+  assert response.json()["detail"] == (
+    "A private stack layer is prepared for a different public action."
+  )
+
+
 def test_existing_pr_stack_update_rejects_newer_live_head_before_any_push(
   client, owner_token, monkeypatch,
 ):

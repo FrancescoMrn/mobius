@@ -64,6 +64,31 @@ def _publication_status(stage: str) -> str:
     raise ContributionSubmitError("This pull request has an invalid publication stage.")
   return "draft" if stage == "draft" else "open"
 
+
+def _require_all_clear_review(record: dict) -> None:
+  """Require an agent verdict pinned to the exact immutable prepared head."""
+  plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+  review = (
+    record.get("quality_review")
+    if isinstance(record.get("quality_review"), dict)
+    else {}
+  )
+  head_sha = str(plan.get("head_sha") or "").lower()
+  reviewed_head_sha = str(review.get("reviewed_head_sha") or "").lower()
+  if (
+    review.get("state") != "all_clear"
+    or not _GIT_SHA.fullmatch(head_sha)
+    or reviewed_head_sha != head_sha
+  ):
+    raise HTTPException(
+      status_code=409,
+      detail=(
+        "This contribution needs a complete agent review on its exact current "
+        "head before it can be sent."
+      ),
+    )
+
+
 @dataclass(frozen=True)
 class PersonalReadyTarget:
   """Exact personal-GitHub PR identity approved by one Ready action."""
@@ -664,6 +689,7 @@ def _claim_stack_records(
   db: Session,
   expected_nonce: str | None,
   allowed_actions: frozenset[str] = frozenset({"pr"}),
+  prepared_actions: frozenset[str] | None = None,
   submitter: str = "contribute-stack-button",
   already_detail: str = "Every PR in this stack has already been submitted.",
 ) -> list[dict]:
@@ -691,7 +717,17 @@ def _claim_stack_records(
     )
   except ContributionSubmitError as exc:
     raise HTTPException(status_code=409, detail=exc.message) from exc
+  claimable_actions = prepared_actions or allowed_actions
   by_id = {row["record"]["id"]: row for row in rows}
+  for item in validated:
+    if item["record"].get("status") == "prepared":
+      plan = item["record"].get("plan") or {}
+      if plan.get("action") not in claimable_actions:
+        raise HTTPException(
+          status_code=409,
+          detail="A private stack layer is prepared for a different public action.",
+        )
+      _require_all_clear_review(item["record"])
   ordered = []
   now = _now_iso()
   for item in validated:

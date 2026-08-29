@@ -2017,7 +2017,11 @@ async def update_contribution_stack(
       record_ids=body.record_ids,
       db=db,
       expected_nonce=expected_nonce,
-      allowed_actions=frozenset({"pr_update"}),
+      # Public parents may retain their original `pr` provenance. They are
+      # validated but never claimed; every private layer must still be an
+      # explicitly reviewed `pr_update`.
+      allowed_actions=_PREPARED_PR_ACTIONS,
+      prepared_actions=frozenset({"pr_update"}),
       submitter="contribute-stack-update-button",
       already_detail="Every PR in this stack already has the reviewed update.",
     )
