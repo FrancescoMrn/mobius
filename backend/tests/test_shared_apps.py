@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from sqlalchemy.orm.attributes import flag_modified
 
-from app import models
+from app import models, shared_app_state
 from app.config import get_settings
 from app.shared_app_retention import purge_expired_shared_apps
 from app.timeutil import SOFT_DELETE_TTL, now_naive_utc
@@ -123,6 +123,38 @@ def test_shared_state_is_path_version_checked_and_visible_to_members(client, aut
     ("set", "board.json"), ("set", "board.json"),
   ]
   assert changes["cursor"] == second.json()["change_id"]
+
+
+def test_shared_state_snapshot_reads_files_and_cursor_under_one_lock(
+  client, auth, db, monkeypatch,
+):
+  project, _output = _built_project(client, auth, db)
+  instance = _create_instance(client, auth, project.id)
+  row = db.get(models.SharedAppInstance, instance["id"])
+  original = shared_app_state.list_changes
+
+  class ReentrantSpy:
+    depth = 0
+
+    def __enter__(self):
+      self.depth += 1
+      return self
+
+    def __exit__(self, *_args):
+      self.depth -= 1
+
+  lock = ReentrantSpy()
+  monkeypatch.setattr(shared_app_state, "state_lock", lambda _instance_id: lock)
+
+  def assert_locked(*args, **kwargs):
+    assert lock.depth == 1
+    return original(*args, **kwargs)
+
+  monkeypatch.setattr(shared_app_state, "list_changes", assert_locked)
+
+  snapshot = shared_app_state.read_state_snapshot(db, row)
+
+  assert snapshot == {"values": {}, "versions": {}, "cursor": 0}
 
 
 def test_shared_state_accepts_only_one_writer_for_one_path_version(client, auth, db):
