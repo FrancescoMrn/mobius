@@ -1,12 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { X } from '@openai/apps-sdk-ui/components/Icon'
-import { api } from '../../api/client.js'
-import { appQueries } from '../../hooks/queries.js'
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import {
   autopilotOnSend,
-  contributionRecoveryAction,
   contributionReviewIntent,
   currentReviewItems,
   diffStatSummary,
@@ -70,7 +67,6 @@ export default function ContributionReviewCard({
     contributionsQuery,
   } = overview
   const queryKey = contributionsQuery.queryKey
-  const { data: appToken } = appQueries.token.useQuery(appId)
   const [dismissRevision, setDismissRevision] = useState(0)
   const [accepted, setAccepted] = useState(() => new Set())
   const acceptedRef = useRef(new Set())
@@ -128,25 +124,10 @@ export default function ContributionReviewCard({
     }
   }
 
-  async function startRecovery(record) {
-    const recovery = contributionRecoveryAction(record)
-    if (!appToken || !recovery) return false
-    let timezone = 'UTC'
-    try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' } catch {}
+  async function continueInSourceChat(record) {
+    if (!record || typeof onContinueInChat !== 'function') return false
     try {
-      const response = await api.appChats.startWithToken(appToken, {
-        title: recovery.title,
-        scope: recovery.scope,
-        scope_label: recovery.scopeLabel,
-        owner_visible: true,
-        content: recovery.draft,
-        cid: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-          ? crypto.randomUUID()
-          : `cid-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-        timezone,
-      })
-      const body = await response.json().catch(() => null)
-      return response.ok && Boolean(body?.chat_id)
+      return await onContinueInChat(record) !== false
     } catch {
       return false
     }
@@ -173,8 +154,9 @@ export default function ContributionReviewCard({
 
     if (publicationFailureOwner(outcome.failure) === 'agent') {
       if (deferRecovery) return { ...outcome, needsRecovery: true }
-      const started = await startRecovery(outcome.record)
-      if (started) return { ...outcome, recoveryStarted: true }
+      if (await continueInSourceChat(outcome.record)) {
+        return { ...outcome, recoveryStarted: true }
+      }
     }
     release(item, outcome.failure)
     return outcome
@@ -184,10 +166,9 @@ export default function ContributionReviewCard({
     const record = item.record
     if (!record) return
     if (!consume(item)) return
-    const started = await startRecovery(record)
-    if (!started) {
+    if (!await continueInSourceChat(record)) {
       release(item, {
-        message: 'The review agent could not start. Try again or open the details.',
+        message: 'This source chat could not continue the review. Try again or open the details.',
       })
     }
   }

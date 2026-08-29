@@ -18,11 +18,13 @@ export const CHAT_CONTRIBUTION_PREPARE_PROMPT = [
 ].join('\n')
 
 export const CHAT_CONTRIBUTION_FINISH_PROMPT = [
-  'Finish organizing and preparing every contribution represented by this chat.',
+  'Prepare every worthwhile contribution represented by this chat for submission.',
   '',
   'First refresh the current Contribute ledger and source state. Sort every worthwhile unsorted change by owning project, reconcile any existing pull requests, prepare exact updates where newer local work belongs to them, and repair any contribution that needs attention. Reuse an existing prepared or public contribution instead of duplicating it.',
   '',
   'Keep all new work private. Do not push, publish, update a pull request, merge, or send anything upstream. Record every intentionally excluded path through the exact edit timestamp reviewed using Contribute’s chat-settlement workflow. Stop at clear approval buttons for every exact public action, then summarize what is ready and what intentionally stays local.',
+  '',
+  'This source chat owns the run and the final contribution records. If genuinely independent project work would benefit from parallel preparation, use durable background Delegation helpers, wait for their results, and integrate them here. Do not create app-owned worker chats or make the owner chase another conversation.',
 ].join('\n')
 
 export function projectContributionPreparePrompt(source) {
@@ -48,15 +50,15 @@ export function openContributionUpdatePrompt(records) {
 
 export function chatContributionPrepareAction() {
   return {
-    label: 'Prepare all',
-    description: 'Sort worthwhile changes into private reviews and settle everything that should stay local.',
+    label: 'Prepare to submit',
+    description: 'Align and review worthwhile work here, then bring back one exact public approval.',
   }
 }
 
 export function chatContributionFinishAction() {
   return {
-    label: 'Handle all',
-    description: 'Resolve every unfinished contribution step without repeating work. Public actions still wait for approval.',
+    label: 'Prepare to submit',
+    description: 'Resolve every private step without repeating work, then bring the exact send decision back here.',
   }
 }
 
@@ -68,16 +70,16 @@ export function chatChangesPrimaryAction(overview) {
     counts.attention > 0 ? 'attention' : '',
   ].filter(Boolean)
   if (kinds.length > 1) return {
-    kind: 'finish', label: 'Handle all',
-    description: 'Prepare new work, repair blocked reviews, and reconcile anything already in progress.',
+    kind: 'finish', label: 'Prepare to submit',
+    description: 'Align new work, repair private reviews, and bring one exact send decision back here.',
   }
   if (counts.unsorted > 0) return {
-    kind: 'prepare', label: 'Prepare all',
-    description: 'Sort reusable work into private reviews and mark intentional local work as settled.',
+    kind: 'prepare', label: 'Prepare to submit',
+    description: 'Sort, align, and review the worthwhile work without leaving this chat.',
   }
   if (counts.attention > 0) return {
-    kind: 'finish', label: 'Fix all',
-    description: 'Give every contribution that needs attention back to the agent in one pass.',
+    kind: 'finish', label: 'Resolve all',
+    description: 'Continue every private fix here and return only the decisions that still need you.',
   }
   if (counts.prepared > 0) return {
     kind: 'review', label: 'Review prepared',

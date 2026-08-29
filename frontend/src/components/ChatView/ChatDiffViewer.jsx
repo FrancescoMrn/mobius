@@ -343,9 +343,6 @@ export default function ChatDiffViewer({
                 {primaryAction.label}
               </button>
             ) : null}
-            {overview.contributeApp ? (
-              <button type="button" onClick={() => openContribute(null, 'reviews:queue')}>Open Contribute</button>
-            ) : null}
           </div>
         </section>
 

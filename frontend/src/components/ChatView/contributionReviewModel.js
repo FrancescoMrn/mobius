@@ -1,7 +1,8 @@
 // Pure model for the chat's contribution review card (view in
 // ContributionReviewCard.jsx). The card keeps the reviewed happy path in the
-// conversation where the work happened and opens Contribute for deeper review,
-// stacks, or recovery. Both surfaces call the same platform-owned mutations.
+// conversation where the work happened, returns private repair to that source
+// chat, and opens Contribute for deeper inspection or stack detail. Both
+// surfaces call the same platform-owned mutations.
 
 // The ledger lives in the Contribute app's storage, so the card resolves that
 // app by slug. Not installed → nothing staged → the card never renders.
@@ -88,9 +89,11 @@ export function contributionFollowupPrompt(record) {
   const id = String(record?.id || '').trim()
   const title = String(record?.title || record?.summary || 'this contribution').trim()
   return [
-    `Inspect and resolve the current attention on contribution ${id} ("${title}").`,
+    `Inspect, fix, and review contribution ${id} ("${title}").`,
     '',
-    'Refresh its GitHub and review state first, then make only the necessary local or private changes. Keep every further public update behind explicit approval in this chat.',
+    'Refresh its recorded source, GitHub, and review state first. If the exact reviewed head already reached the pull request, reconcile the contribution record and inspect its current checks. If the branch moved, rebuild the private review on its current head and run the relevant checks.',
+    '',
+    'Make only the necessary local or private changes. Keep every further public update behind explicit approval in this chat.',
   ].join('\n')
 }
 
@@ -239,7 +242,8 @@ export function diffStatSummary(value) {
  * The failure this card should currently explain, or null when there is none.
  *
  * A send that failed is a fact about the record, not about this render, so the
- * compact doorway still explains it after a reload. Contribute owns retrying.
+ * compact doorway still explains it after a reload. Its source chat owns the
+ * private repair; Contribute remains the detailed inspection surface.
  */
 export function submitFailure(record, { attempt = null, sending = false } = {}) {
   if (sending) return null
@@ -268,57 +272,6 @@ export function submitFailure(record, { attempt = null, sending = false } = {}) 
     detail: [message, detail].filter(Boolean).join('\n\n'),
     code,
   }
-}
-
-/** The private agent intent behind the chat card's primary recovery action. */
-export function contributionRecoveryDraft(record) {
-  const id = String(record?.id || '').trim()
-  const title = String(record?.title || 'untitled').trim()
-  return [
-    `Fix and review contribution ${id} ("${title}").`,
-    '',
-    'Refresh the recorded pull request and branch first. If the exact reviewed head already reached the pull request, reconcile the contribution record and inspect its current checks. If the branch moved, rebuild the private review on its current head and run the relevant checks.',
-    '',
-    'Keep any further public update behind the existing approval button.',
-  ].join('\n')
-}
-
-function contributionRecoveryScope(record) {
-  const id = String(record?.id || '').trim()
-  if (!id) return ''
-  const head = String(record?.plan?.head_sha || '')
-  const input = `recovery\u0000${id}\u0000${head}`
-  let hash = 0xcbf29ce484222325n
-  for (let index = 0; index < input.length; index += 1) {
-    hash ^= BigInt(input.charCodeAt(index))
-    hash = BigInt.asUintN(64, hash * 0x100000001b3n)
-  }
-  return `contribute-review:${hash.toString(16).padStart(16, '0')}`
-}
-
-/** One exact failed prepared head owns one app-attributed recovery run. */
-export function contributionRecoveryAction(record) {
-  const scope = contributionRecoveryScope(record)
-  if (!scope) return null
-  return {
-    title: `Fix and review ${record?.title || 'contribution'}`,
-    scope,
-    scopeLabel: 'Fix and review contribution',
-    draft: contributionRecoveryDraft(record),
-  }
-}
-
-export function contributionReviewRunPhase(runtime) {
-  if (!runtime || typeof runtime !== 'object') return 'existing'
-  if (runtime.running) return 'running'
-  if (runtime.pending_question_id) return 'waiting'
-  if (Array.isArray(runtime.pending_messages) && runtime.pending_messages.length > 0) {
-    return 'running'
-  }
-  const goal = runtime.goal
-  if (goal?.status === 'running') return 'running'
-  if (goal?.status === 'paused') return 'paused'
-  return 'existing'
 }
 
 /** Copy for the grouped panel while it still has pending work. */

@@ -17,16 +17,16 @@ test('chat preparation is private, scoped to recorded edits, and leaves publishi
 })
 
 test('action copy names user intent instead of internal queue timing', () => {
-  assert.equal(chatContributionPrepareAction(false).label, 'Prepare all')
-  assert.equal(chatContributionPrepareAction(true).label, 'Prepare all')
+  assert.equal(chatContributionPrepareAction(false).label, 'Prepare to submit')
+  assert.equal(chatContributionPrepareAction(true).label, 'Prepare to submit')
 })
 
 test('Changes exposes one context-aware primary action', () => {
-  assert.equal(chatChangesPrimaryAction({ counts: { unsorted: 4 } }).label, 'Prepare all')
-  assert.equal(chatChangesPrimaryAction({ counts: { attention: 2 } }).label, 'Fix all')
+  assert.equal(chatChangesPrimaryAction({ counts: { unsorted: 4 } }).label, 'Prepare to submit')
+  assert.equal(chatChangesPrimaryAction({ counts: { attention: 2 } }).label, 'Resolve all')
   assert.equal(chatChangesPrimaryAction({ counts: { prepared: 2 } }).label, 'Review prepared')
   assert.equal(chatChangesPrimaryAction({ counts: { open: 2 } }).label, 'Check for updates')
-  assert.equal(chatChangesPrimaryAction({ counts: { unsorted: 1, prepared: 1 } }).label, 'Handle all')
+  assert.equal(chatChangesPrimaryAction({ counts: { unsorted: 1, prepared: 1 } }).label, 'Prepare to submit')
   assert.equal(chatChangesPrimaryAction({ counts: {} }), null)
 })
 

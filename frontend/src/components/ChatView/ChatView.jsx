@@ -4052,7 +4052,12 @@ export default function ChatView({
         return false
       }
     }
-    await doSend(prompt, { attachments: [], preserveComposer: true })
+    await doSend(prompt, {
+      attachments: [],
+      preserveComposer: true,
+      hidden: true,
+      pin: false,
+    })
     const promptPresent = [
       ...(pendingQueue.pendingMessagesRef.current || []),
       ...(messagesRef.current || []).slice(-12),
@@ -4128,7 +4133,7 @@ export default function ChatView({
     setShowChanges(false)
     const prompt = contributionFollowupPrompt(record)
     const revision = reviewActionKey(record)
-    void sendContributionIntent(
+    return sendContributionIntent(
       `followup:${revision}`,
       prompt,
       revision ? { kind: 'records', recordKeys: [revision] } : null,

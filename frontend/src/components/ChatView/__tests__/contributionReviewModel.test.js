@@ -13,9 +13,6 @@ import {
   contributeApp,
   contributeAppId,
   contributionFollowupPrompt,
-  contributionRecoveryAction,
-  contributionRecoveryDraft,
-  contributionReviewRunPhase,
   contributionReviewIntent,
   currentReviewItems,
   diffStatSummary,
@@ -201,7 +198,7 @@ test('direct send requires the exact reviewed happy path', () => {
   assert.equal(autopilotOnSend({ autopilot_available: false }), false)
 })
 
-test('failed publication becomes a calm recovery action, not another blind send', () => {
+test('failed publication returns private recovery to its source chat', () => {
   const record = {
     id: 'existing-pr',
     title: 'Refine the existing contribution',
@@ -216,39 +213,36 @@ test('failed publication becomes a calm recovery action, not another blind send'
     detail: record.last_submit_error,
     code: '',
   })
-  assert.match(contributionRecoveryDraft(record), /^Fix and review contribution existing-pr/)
-  assert.match(contributionRecoveryDraft(record), /reconcile the contribution record/)
-  assert.match(contributionRecoveryDraft(record), /existing approval button/)
-  const recovery = contributionRecoveryAction(record)
-  assert.equal(recovery.scope, 'contribute-review:b0661670f342e064')
-  assert.equal(recovery.scopeLabel, 'Fix and review contribution')
-  assert.equal(recovery.draft, contributionRecoveryDraft(record))
+  const followup = contributionFollowupPrompt(record)
+  assert.match(followup, /^Inspect, fix, and review contribution existing-pr/)
+  assert.match(followup, /reconcile the contribution record/)
+  assert.match(followup, /explicit approval in this chat/)
   assert.match(cardSrc, />\s*Fix and review\s*</)
   assert.match(cardSrc, />\s*Details\s*</)
   assert.doesNotMatch(cardSrc, /contrib-card__progress/)
   assert.doesNotMatch(chatViewSrc, /handleContributionRecovery|onFixContribution/)
-  assert.match(cardSrc, /api\.appChats\.startWithToken\(appToken/)
+  assert.doesNotMatch(cardSrc, /api\.appChats\.startWithToken|appQueries\.token|startRecovery/)
   assert.match(cardSrc, /async function fixItem/)
-  assert.match(cardSrc, /const started = await startRecovery\(record\)/)
+  assert.match(cardSrc, /if \(!await continueInSourceChat\(record\)\)/)
+  assert.match(
+    cardSrc,
+    /publicationFailureOwner\(outcome\.failure\) === 'agent'[\s\S]*?await continueInSourceChat\(outcome\.record\)/,
+  )
   assert.match(cardSrc, /onOpenApp\(contributeApp, \{ final: true, intent \}\)[\s\S]*onDismiss\(\)/)
 })
 
-test('agent contribution intents refresh their lifecycle before sending', () => {
+test('agent contribution intents keep their lifecycle while staying hidden and unpinned', () => {
   assert.match(
     chatViewSrc,
     /const overview = await refreshContributionOverview\(\)[\s\S]*?overview && !chatChangesActionIsCurrent\(overview, action\)[\s\S]*?await doSend\(prompt/,
   )
+  assert.match(
+    chatViewSrc,
+    /await doSend\(prompt, \{[\s\S]*?attachments: \[\],[\s\S]*?preserveComposer: true,[\s\S]*?hidden: true,[\s\S]*?pin: false,[\s\S]*?\}\)/,
+  )
   assert.match(chatViewSrc, /kind: 'unsorted', revision/)
   assert.match(chatViewSrc, /kind: 'workflow', revision/)
   assert.match(chatViewSrc, /kind: 'records', recordKeys/)
-})
-
-test('existing review runtime becomes one unambiguous continuation state', () => {
-  assert.equal(contributionReviewRunPhase({ running: true }), 'running')
-  assert.equal(contributionReviewRunPhase({ pending_question_id: 'q1' }), 'waiting')
-  assert.equal(contributionReviewRunPhase({ goal: { status: 'paused' } }), 'paused')
-  assert.equal(contributionReviewRunPhase({ running: false }), 'existing')
-  assert.equal(contributionReviewRunPhase(null), 'existing')
 })
 
 test('multiple independent items share one centered bounded panel', () => {
@@ -448,7 +442,7 @@ test('healthy sent records leave chat while attention can hand work back to the 
   assert.match(cardSrc, /acceptedRef\.current\.has\(key\)/)
   assert.match(
     chatViewSrc,
-    /const revision = reviewActionKey\(record\)[\s\S]*?sendContributionIntent\([\s\S]*?`followup:\$\{revision\}`/,
+    /const revision = reviewActionKey\(record\)[\s\S]*?return sendContributionIntent\([\s\S]*?`followup:\$\{revision\}`/,
   )
   assert.match(chatViewSrc, /onContinueInChat=\{handleContributionFollowup\}/)
   assert.match(publicationSrc, /publication\?\.record\?\.status === 'draft'/)
@@ -458,9 +452,13 @@ test('chat cards keep direct send and exact review on the same guarded routes', 
   assert.match(clientSrc, /record\?\.action === 'pr_update'/)
   assert.match(clientSrc, /update-existing/)
   assert.match(publicationSrc, /publish = api\.contributions\.publish/)
+  assert.match(clientSrc, /submitter: 'chat-review-card',[\s\S]*?publication_stage: 'ready'/)
+  assert.match(clientSrc, /record_ids: \(records \|\| \[\]\)\.map\(record => record\.id\),[\s\S]*?publication_stage: 'ready'/)
   assert.match(cardSrc, /consume\(item\)[\s\S]*const outcome = await publishContribution\(\{/)
   assert.match(cardSrc, /publicationFailureOwner\(outcome\.failure\) === 'agent'/)
-  assert.match(cardSrc, /const started = await startRecovery/)
+  assert.match(cardSrc, /async function continueInSourceChat\(record\)/)
+  assert.match(cardSrc, /onContinueInChat\(record\)/)
+  assert.doesNotMatch(cardSrc, /appChats\.startWithToken|contribute-review:/)
   assert.doesNotMatch(cardSrc, /contrib-card__progress/)
   assert.match(cardSrc, />\s*Review\s*</)
   assert.doesNotMatch(cardSrc, /body_draft|record\.files|The exact text that will be published/)
