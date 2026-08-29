@@ -36,6 +36,11 @@
   background: var(--surface);
 }
 
+.contrib-card-stack__heading.is-confirming {
+  display: block;
+  padding: 0;
+}
+
 .contrib-card-stack__heading-copy {
   min-width: 0;
 }
@@ -323,6 +328,10 @@
   padding: 14px 16px;
   border-top: 1px solid var(--border);
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+
+.contrib-card-stack__heading > .contrib-card-stack__confirm {
+  border-top: 0;
 }
 
 .contrib-card-stack__confirm > strong {

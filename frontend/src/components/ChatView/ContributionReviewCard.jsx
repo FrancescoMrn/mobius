@@ -305,33 +305,51 @@ export default function ContributionReviewCard({
       aria-label={grouped ? panel.title : undefined}
     >
       {grouped ? (
-        <div className="contrib-card-stack__heading">
-          <div className="contrib-card-stack__heading-copy">
-            <div className="contrib-card-stack__title">{panel.title}</div>
-            <div className="contrib-card-stack__copy">{panel.copy}</div>
-          </div>
-          <div className="contrib-card-stack__heading-actions">
-            {groupDefault ? (
-              <button
-                type="button"
-                className="contrib-card-stack__default"
-                disabled={Boolean(batchPhase) || (turnActive && groupNeedsAgent)}
-                onClick={runGroupDefault}
-              >
-                {groupDefault.label}
-              </button>
-            ) : null}
-            <button
-              type="button"
-              className="contrib-card-stack__dismiss-all"
-              disabled={Boolean(batchPhase)}
-              aria-label="Dismiss all — keeps the work in Changes and Contribute"
-              onClick={dismissAll}
-            >
-              <X width={16} height={16} aria-hidden="true" />
-            </button>
-          </div>
+        <div className={`contrib-card-stack__heading${confirmingItems ? ' is-confirming' : ''}`}>
+          {confirmingItems ? (
+            <StackPublicationConfirmation
+              items={confirmingItems}
+              phase={batchPhase}
+              onCancel={() => setConfirmingItems(null)}
+              onConfirm={publishConfirmedItems}
+            />
+          ) : (
+            <>
+              <div className="contrib-card-stack__heading-copy">
+                <div className="contrib-card-stack__title">{panel.title}</div>
+                <div className="contrib-card-stack__copy">{panel.copy}</div>
+              </div>
+              <div className="contrib-card-stack__heading-actions">
+                {groupDefault ? (
+                  <button
+                    type="button"
+                    className="contrib-card-stack__default"
+                    disabled={Boolean(batchPhase) || (turnActive && groupNeedsAgent)}
+                    onClick={runGroupDefault}
+                  >
+                    {groupDefault.label}
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="contrib-card-stack__dismiss-all"
+                  disabled={Boolean(batchPhase)}
+                  aria-label="Dismiss all — keeps the work in Changes and Contribute"
+                  onClick={dismissAll}
+                >
+                  <X width={16} height={16} aria-hidden="true" />
+                </button>
+              </div>
+            </>
+          )}
         </div>
+      ) : confirmingItems ? (
+        <StackPublicationConfirmation
+          items={confirmingItems}
+          phase={batchPhase}
+          onCancel={() => setConfirmingItems(null)}
+          onConfirm={publishConfirmedItems}
+        />
       ) : null}
       {pendingItems.map(item => {
         if (item.kind === 'unsorted') {
@@ -400,14 +418,6 @@ export default function ContributionReviewCard({
           />
         )
       })}
-      {confirmingItems ? (
-        <StackPublicationConfirmation
-          items={confirmingItems}
-          phase={batchPhase}
-          onCancel={() => setConfirmingItems(null)}
-          onConfirm={publishConfirmedItems}
-        />
-      ) : null}
     </div>
   )
 }
@@ -608,6 +618,10 @@ function StackReviewRow({
 function StackPublicationConfirmation({ items, phase, onCancel, onConfirm }) {
   const action = publicationItemsAction(items)
   const busy = Boolean(phase)
+  const cancelRef = useRef(null)
+  useEffect(() => {
+    cancelRef.current?.focus()
+  }, [])
   const busyLabel = phase === 'checking'
     ? 'Checking…'
     : action.updating ? 'Updating…' : 'Sending…'
@@ -620,7 +634,7 @@ function StackPublicationConfirmation({ items, phase, onCancel, onConfirm }) {
       <strong>{action.promptLabel}</strong>
       <span>GitHub will receive only these exact reviewed heads. Nothing is merged.</span>
       <div className="contrib-card__actions">
-        <button type="button" className="contrib-card__review" disabled={busy} onClick={onCancel}>Keep private</button>
+        <button ref={cancelRef} type="button" className="contrib-card__review" disabled={busy} onClick={onCancel}>Keep private</button>
         <button type="button" className="contrib-card__send" disabled={busy} onClick={onConfirm}>
           {busy ? busyLabel : action.confirmLabel}
         </button>

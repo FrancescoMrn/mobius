@@ -588,6 +588,15 @@ test('batch publication refreshes before GitHub and recovers at most once', () =
   assert.match(cardSrc, /onContinueInChat=\{turnActive \? null/)
 })
 
+test('batch approval replaces the sticky group header instead of rendering after a long list', () => {
+  const confirmation = cardSrc.indexOf('<StackPublicationConfirmation')
+  const rows = cardSrc.indexOf('{pendingItems.map')
+  assert.ok(confirmation >= 0 && confirmation < rows)
+  assert.match(cardSrc, /contrib-card-stack__heading\$\{confirmingItems \? ' is-confirming' : ''\}/)
+  assert.match(cardSrc, /const cancelRef = useRef\(null\)[\s\S]*cancelRef\.current\?\.focus\(\)/)
+  assert.match(cardCss, /\.contrib-card-stack__heading\.is-confirming\s*\{[^}]*display:\s*block;[^}]*padding:\s*0;/s)
+})
+
 test('the dismissal gesture is claimed with a non-passive touchmove', () => {
   assert.match(cardSrc, /addEventListener\('touchmove', onMove, \{ passive: false \}\)/)
   assert.match(cardSrc, /event\.preventDefault\(\)/)
