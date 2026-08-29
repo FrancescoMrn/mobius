@@ -887,13 +887,17 @@ def _chat_record_coverage_at(record: dict) -> str:
     if isinstance(record.get("quality_review"), dict)
     else {}
   )
+  # These are ordered by authority rather than chronology. An exact review
+  # witnesses the source that was inspected; a later push only publishes that
+  # same source and must not cover intervening chat edits. Publication times
+  # remain a conservative compatibility witness for older records that do not
+  # carry review metadata.
   candidates = [
     record.get("coverage_at"),
     quality.get("reviewed_at"),
     record.get("last_updated_pr_at"),
     record.get("submitted_at"),
   ]
-  parsed: list[tuple[datetime, str]] = []
   for value in candidates:
     if not isinstance(value, str) or not value.strip():
       continue
@@ -904,12 +908,7 @@ def _chat_record_coverage_at(record: dict) -> str:
       continue
     if instant.tzinfo is None:
       instant = instant.replace(tzinfo=UTC)
-    parsed.append((instant.astimezone(UTC), normalized))
-  if parsed:
-    return max(parsed, key=lambda item: item[0])[1]
-  for value in (record.get("updated_at"), record.get("created_at")):
-    if isinstance(value, str) and value.strip():
-      return value.strip()
+    return normalized
   return ""
 
 
