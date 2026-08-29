@@ -48,6 +48,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urljoin, urlparse
+from weakref import WeakValueDictionary
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -156,6 +157,12 @@ from app.github_contributions import (
   _mark_submit_failure,
   _mark_submit_success,
   _mark_existing_pr_update_success,
+  _claim_personal_pr_ready,
+  _inspect_personal_pr_ready_target,
+  _mark_personal_pr_ready,
+  _settle_personal_pr_ready,
+  _release_personal_pr_ready,
+  _note_personal_pr_ready_unconfirmed,
   _mark_stack_submit_failure,
   _stack_record_snapshots,
   _parse_pr_number,
@@ -229,6 +236,7 @@ class GraphqlRequest(BaseModel):
 
 class ContributionStackSubmitRequest(BaseModel):
   record_ids: list[str]
+  publication_stage: Literal["draft", "ready"] = "draft"
 
 
 class ContributionSubmitBody(BaseModel):
@@ -244,6 +252,9 @@ class ContributionSubmitBody(BaseModel):
   submitter: Literal["contribute-button", "chat-review-card"] = (
     "contribute-button"
   )
+  # A ready PR requests review immediately; draft remains the compatibility
+  # default for callers that have not yet added that explicit approval copy.
+  publication_stage: Literal["draft", "ready"] = "draft"
 
 
 class ChatSettlementItem(BaseModel):
@@ -303,6 +314,39 @@ class AutopilotToggleBody(BaseModel):
 
 class ContributionStackLandRequest(BaseModel):
   record_ids: list[str]
+
+
+class ContributionReadyBody(BaseModel):
+  # The public head shown by the owner-facing confirmation. The server also
+  # derives it independently from the durable reviewed record and GitHub.
+  expected_head_sha: str
+
+
+_ready_action_locks: "WeakValueDictionary[str, asyncio.Lock]" = (
+  WeakValueDictionary()
+)
+
+
+def _ready_action_lock(app_id: int, record_id: str) -> asyncio.Lock:
+  """Serialize one record's Ready/recovery lifecycle in this worker.
+
+  Möbius serves one uvicorn worker, so this closes the only live overlap: a
+  second request must not observe the saved claim while the first request is
+  still between its GitHub mutation and settlement. The durable claim remains
+  the restart boundary; after a restart there is no in-flight first request,
+  so the ordinary read-only recovery path is authoritative.
+  """
+  key = f"{app_id}:{record_id}"
+  lock = _ready_action_locks.get(key)
+  if lock is None:
+    lock = asyncio.Lock()
+    _ready_action_locks[key] = lock
+  return lock
+
+
+async def _serialize_ready_action(app_id: int, record_id: str):
+  async with _ready_action_lock(app_id, record_id):
+    yield
 
 
 
@@ -1452,7 +1496,12 @@ async def submit_contribution(
           fs_locks.source_dir_lock(lock_path)
         )
       pr_url, number, record_patch = await asyncio.to_thread(
-        _submit_prepared_pr, claimed, diff_path,
+        _submit_prepared_pr,
+        claimed,
+        diff_path,
+        publication_stage=(
+          body.publication_stage if body is not None else "draft"
+        ),
       )
       try:
         await _record_pending_equivalence_locked(
@@ -1552,6 +1601,179 @@ async def submit_contribution(
       log.warning("autopilot grant stamp failed %s/%s", app_id, record_id,
                   exc_info=True)
   return {"record": submitted, "url": pr_url, "number": number}
+
+
+@router.post(
+  "/contributions/{app_id}/{record_id}/ready",
+  dependencies=[
+    Depends(reject_cross_site),
+    Depends(_serialize_ready_action),
+  ],
+)
+@_limiter.limit("10/minute")
+async def mark_contribution_ready(
+  request: Request,
+  app_id: int,
+  record_id: str,
+  body: ContributionReadyBody,
+  db: Session = Depends(get_db),
+  principal: Principal = Depends(get_principal),
+):
+  """Mark one exact personal-GitHub draft ready after an explicit owner click.
+
+  The durable claim is written before the mutation. A repeated call with that
+  claim only re-reads GitHub and either settles the observed ready state or
+  reopens the action; it never repeats an ambiguously acknowledged mutation.
+  """
+  expected_nonce = _validate_submit_app(app_id, principal, db)
+  db.close()
+  async with fs_locks.app_storage_lock(app_id):
+    _claimed, record_path, target, mode = _claim_personal_pr_ready(
+      app_id=app_id,
+      record_id=record_id,
+      expected_head_sha=body.expected_head_sha,
+      db=db,
+      expected_nonce=expected_nonce,
+    )
+  db.close()
+
+  if mode == "recover":
+    try:
+      live = await asyncio.to_thread(_inspect_personal_pr_ready_target, target)
+    except ContributionSubmitError as exc:
+      if exc.code == "ready_target_changed":
+        async with fs_locks.app_storage_lock(app_id):
+          _recheck_submit_app(db, app_id, expected_nonce)
+          record = _release_personal_pr_ready(record_path, target, exc)
+        raise HTTPException(
+          status_code=409,
+          detail={
+            "code": "ready_target_changed",
+            "message": exc.message,
+            "detail": exc.detail,
+            "record": record,
+          },
+        ) from exc
+      pending = ContributionSubmitError(
+        "GitHub still has not confirmed the saved Ready action. Contribute will only re-read it again.",
+        status_code=503,
+        code="ready_unconfirmed",
+        detail=exc.detail or exc.message,
+      )
+      async with fs_locks.app_storage_lock(app_id):
+        _recheck_submit_app(db, app_id, expected_nonce)
+        record = _note_personal_pr_ready_unconfirmed(
+          record_path, target, pending,
+        )
+      raise HTTPException(
+        status_code=503,
+        detail={
+          "code": "ready_unconfirmed",
+          "message": pending.message,
+          "detail": pending.detail,
+          "record": record,
+        },
+      ) from exc
+    if live["is_draft"]:
+      not_applied = ContributionSubmitError(
+        "The earlier Ready action did not change this pull request. It is still a draft; approve Ready again to retry.",
+        code="ready_not_applied",
+      )
+      async with fs_locks.app_storage_lock(app_id):
+        _recheck_submit_app(db, app_id, expected_nonce)
+        record = _release_personal_pr_ready(
+          record_path, target, not_applied, confirmed_draft=True,
+        )
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "code": "ready_not_applied",
+          "message": not_applied.message,
+          "record": record,
+        },
+      )
+    async with fs_locks.app_storage_lock(app_id):
+      _recheck_submit_app(db, app_id, expected_nonce)
+      ready = _settle_personal_pr_ready(record_path, target)
+    return {"record": ready, "url": target.url, "number": target.number}
+
+  mutation_completed = False
+  try:
+    live = await asyncio.to_thread(_inspect_personal_pr_ready_target, target)
+    if live["is_draft"]:
+      if live["auto_merge_enabled"]:
+        raise ContributionSubmitError(
+          "This draft already has auto-merge enabled. Ready could merge it immediately, so nothing was changed.",
+          code="ready_auto_merge_enabled",
+        )
+      await asyncio.to_thread(
+        _mark_personal_pr_ready,
+        target,
+        node_id=str(live["node_id"]),
+      )
+      mutation_completed = True
+      try:
+        live = await asyncio.to_thread(_inspect_personal_pr_ready_target, target)
+      except ContributionSubmitError as exc:
+        raise ContributionSubmitError(
+          "GitHub did not confirm whether this pull request became ready. Contribute saved the action and will only re-read its state.",
+          status_code=503,
+          code="ready_unconfirmed",
+          detail=exc.detail or exc.message,
+        ) from exc
+      if live["is_draft"]:
+        raise ContributionSubmitError(
+          "GitHub did not confirm whether this pull request became ready. Contribute saved the action and will only re-read its state.",
+          status_code=503,
+          code="ready_unconfirmed",
+        )
+  except ContributionSubmitError as exc:
+    preserve_claim = exc.code == "ready_unconfirmed" or mutation_completed
+    async with fs_locks.app_storage_lock(app_id):
+      _recheck_submit_app(db, app_id, expected_nonce)
+      record = (
+        _note_personal_pr_ready_unconfirmed(record_path, target, exc)
+        if preserve_claim
+        else _release_personal_pr_ready(
+          record_path,
+          target,
+          exc,
+        )
+      )
+    raise HTTPException(
+      status_code=exc.status_code,
+      detail={
+        "code": exc.code or "ready_failed",
+        "message": exc.message,
+        "detail": exc.detail,
+        "record": record,
+      },
+    ) from exc
+  except Exception as exc:
+    log.exception("Contribution Ready action failed for %s/%s", app_id, record_id)
+    pending = ContributionSubmitError(
+      "GitHub did not confirm whether this pull request became ready. Contribute saved the action and will only re-read its state.",
+      status_code=503,
+      code="ready_unconfirmed",
+    )
+    async with fs_locks.app_storage_lock(app_id):
+      _recheck_submit_app(db, app_id, expected_nonce)
+      record = _note_personal_pr_ready_unconfirmed(
+        record_path, target, pending,
+      )
+    raise HTTPException(
+      status_code=503,
+      detail={
+        "code": "ready_unconfirmed",
+        "message": pending.message,
+        "record": record,
+      },
+    ) from exc
+
+  async with fs_locks.app_storage_lock(app_id):
+    _recheck_submit_app(db, app_id, expected_nonce)
+    ready = _settle_personal_pr_ready(record_path, target)
+  return {"record": ready, "url": target.url, "number": target.number}
 
 
 def _prepared_existing_pr_target(record: dict) -> tuple[str, int, str, str]:
@@ -2049,6 +2271,7 @@ async def submit_contribution_stack(
             record,
             row["diff_path"],
             direct_base_branch=row["stack"]["base_branch"],
+            publication_stage=body.publication_stage,
           )
           try:
             await _record_pending_equivalence_locked(

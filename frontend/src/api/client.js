@@ -687,6 +687,7 @@ export const api = {
           body: JSON.stringify(update ? {} : {
             autopilot,
             submitter: 'chat-review-card',
+            publication_stage: 'ready',
           }),
         },
       )
@@ -702,6 +703,7 @@ export const api = {
           method: 'POST',
           body: JSON.stringify({
             record_ids: (records || []).map(record => record.id),
+            ...(updating ? {} : { publication_stage: 'ready' }),
           }),
         },
       )

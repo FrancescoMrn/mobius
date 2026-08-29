@@ -1259,6 +1259,303 @@ def _write_contribution(app_id, record_id, record, diff_text=""):
     atomic_write(base / f"{record_id}.diff", diff_text)
 
 
+def _write_personal_draft(app_id, record_id="personal-draft", number=58):
+  head = "a" * 40
+  base = "b" * 40
+  repo_path = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
+  (repo_path / ".git").mkdir(parents=True)
+  record = {
+    "id": record_id,
+    "type": "pr",
+    "repo": "mobius-os/app-demo",
+    "status": "draft",
+    "publication_stage": "draft",
+    "number": number,
+    "url": f"https://github.com/mobius-os/app-demo/pull/{number}",
+    "branch": "feat/existing-review",
+    "head_repository": "octocat/app-demo",
+    "last_submit_push_sha": head,
+    "last_submit_upstream_branch": "main",
+    "submitted_at": "2026-08-29T08:00:00Z",
+    "plan": {
+      "action": "pr",
+      "repo": "mobius-os/app-demo",
+      "repo_path": str(repo_path),
+      "branch": "feat/existing-review",
+      "base_sha": base,
+      "head_sha": head,
+      "diff_sha256": hashlib.sha256(b"reviewed").hexdigest(),
+    },
+    "quality_review": {
+      "state": "all_clear",
+      "reviewed_head_sha": head,
+      "reviewed_at": "2026-08-29T07:59:00Z",
+    },
+  }
+  _write_contribution(app_id, record_id, record)
+  return record
+
+def _personal_pr_live(record, *, draft, head_sha=None, auto_merge=None):
+  return {
+    "node_id": "PR_kwDO_ready_58",
+    "html_url": record["url"],
+    "state": "open",
+    "draft": draft,
+    "auto_merge": auto_merge,
+    "head": {
+      "ref": record["plan"]["branch"],
+      "sha": head_sha or record["last_submit_push_sha"],
+      "repo": {"full_name": record["head_repository"]},
+    },
+    "base": {
+      "ref": record["last_submit_upstream_branch"],
+      "repo": {"full_name": record["repo"]},
+    },
+  }
+
+def test_mark_ready_mutates_once_after_exact_live_identity(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record = _write_personal_draft(app_id)
+  monkeypatch.setattr(
+    "app.github_contributions.shutil.which", lambda name: f"/bin/{name}",
+  )
+  calls = []
+  reads = 0
+
+  def fake_gh(_repo_path, *args, check=True):
+    nonlocal reads
+    calls.append(args)
+    if args[:2] == ("api", f"repos/{record['repo']}/pulls/{record['number']}"):
+      reads += 1
+      return _cp(json.dumps(_personal_pr_live(record, draft=reads == 1)))
+    if args[:2] == ("api", "graphql"):
+      return _cp(json.dumps({"data": {
+        "markPullRequestReadyForReview": {"pullRequest": {
+          "id": "PR_kwDO_ready_58",
+          "isDraft": False,
+          "headRefOid": record["last_submit_push_sha"],
+          "url": record["url"],
+        }},
+      }}))
+    pytest.fail(f"unexpected gh call: {args}")
+
+  monkeypatch.setattr("app.github_contribution_git._gh", fake_gh)
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record['id']}/ready",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"expected_head_sha": record["last_submit_push_sha"]},
+  )
+
+  assert response.status_code == 200, response.text
+  ready = response.json()["record"]
+  assert ready["status"] == "open"
+  assert ready["publication_stage"] == "ready"
+  assert ready["last_ready_head_sha"] == record["last_submit_push_sha"]
+  assert "readying" not in ready
+  assert [call[:2] for call in calls] == [
+    ("api", f"repos/{record['repo']}/pulls/{record['number']}"),
+    ("api", "graphql"),
+    ("api", f"repos/{record['repo']}/pulls/{record['number']}"),
+  ]
+  mutation = calls[1]
+  assert "markPullRequestReadyForReview" in mutation[mutation.index("-f") + 1]
+  assert "pullRequestId=PR_kwDO_ready_58" in mutation
+
+@pytest.mark.parametrize("mutation_failure", ["timeout", "nonzero"])
+def test_mark_ready_lost_response_recovers_by_read_without_second_mutation(
+  client, owner_token, monkeypatch, mutation_failure,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record = _write_personal_draft(
+    app_id, f"personal-draft-recovery-{mutation_failure}",
+  )
+  monkeypatch.setattr(
+    "app.github_contributions.shutil.which", lambda name: f"/bin/{name}",
+  )
+  calls = []
+  recovering = False
+
+  def fake_gh(_repo_path, *args, check=True):
+    calls.append(args)
+    if args[:2] == ("api", f"repos/{record['repo']}/pulls/{record['number']}"):
+      return _cp(json.dumps(_personal_pr_live(record, draft=not recovering)))
+    if args[:2] == ("api", "graphql"):
+      if mutation_failure == "timeout":
+        raise subprocess.TimeoutExpired(["gh", "api", "graphql"], timeout=30)
+      return _cp("", "network response ended early", returncode=1)
+    pytest.fail(f"unexpected gh call: {args}")
+
+  monkeypatch.setattr("app.github_contribution_git._gh", fake_gh)
+  url = f"/api/github/contributions/{app_id}/{record['id']}/ready"
+  headers = {"Authorization": f"Bearer {app_token}"}
+  payload = {"expected_head_sha": record["last_submit_push_sha"]}
+
+  first = client.post(url, headers=headers, json=payload)
+  assert first.status_code == 503, first.text
+  assert first.json()["detail"]["code"] == "ready_unconfirmed"
+  assert first.json()["detail"]["record"]["readying"]["expected_head_sha"] == (
+    record["last_submit_push_sha"]
+  )
+
+  recovering = True
+  second = client.post(url, headers=headers, json=payload)
+  assert second.status_code == 200, second.text
+  assert second.json()["record"]["publication_stage"] == "ready"
+  assert "readying" not in second.json()["record"]
+  assert sum(call[:2] == ("api", "graphql") for call in calls) == 1
+
+def test_mark_ready_recovery_releases_a_changed_live_target(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record = _write_personal_draft(app_id, "personal-draft-recovery-drift")
+  record["readying"] = {
+    "version": 1,
+    "repo": record["repo"],
+    "number": record["number"],
+    "url": record["url"],
+    "head_repository": record["head_repository"],
+    "head_branch": record["plan"]["branch"],
+    "base_branch": record["last_submit_upstream_branch"],
+    "expected_head_sha": record["last_submit_push_sha"],
+    "started_at": "2026-08-29T08:01:00Z",
+  }
+  _write_contribution(app_id, record["id"], record)
+  monkeypatch.setattr(
+    "app.github_contributions.shutil.which", lambda name: f"/bin/{name}",
+  )
+  calls = []
+
+  def fake_gh(_repo_path, *args, check=True):
+    calls.append(args)
+    return _cp(json.dumps(_personal_pr_live(
+      record, draft=True, head_sha="c" * 40,
+    )))
+
+  monkeypatch.setattr("app.github_contribution_git._gh", fake_gh)
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record['id']}/ready",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"expected_head_sha": record["last_submit_push_sha"]},
+  )
+
+  assert response.status_code == 409, response.text
+  assert response.json()["detail"]["code"] == "ready_target_changed"
+  stored = json.loads(
+    (Path(get_settings().data_dir) / "apps" / str(app_id) /
+     "contributions" / f"{record['id']}.json").read_text()
+  )
+  assert "readying" not in stored
+  assert stored["last_ready_error_code"] == "ready_target_changed"
+  assert len(calls) == 1
+
+def test_mark_ready_rejects_changed_head_and_relay_without_github(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record = _write_personal_draft(app_id, "personal-draft-stale")
+  calls = []
+  monkeypatch.setattr(
+    "app.github_contribution_git._gh",
+    lambda *_args, **_kwargs: calls.append(True) or _cp(""),
+  )
+  headers = {"Authorization": f"Bearer {app_token}"}
+
+  stale = client.post(
+    f"/api/github/contributions/{app_id}/{record['id']}/ready",
+    headers=headers,
+    json={"expected_head_sha": "c" * 40},
+  )
+  assert stale.status_code == 409, stale.text
+  assert "changed after the Ready action was shown" in stale.json()["detail"]
+
+  record["id"] = "relay-draft"
+  record["submission_mode"] = "mobius-bot"
+  record["relay_contribution_id"] = "ctr_1234567890abcdef1234567890abcdef"
+  _write_contribution(app_id, record["id"], record)
+  relay = client.post(
+    f"/api/github/contributions/{app_id}/{record['id']}/ready",
+    headers=headers,
+    json={"expected_head_sha": record["last_submit_push_sha"]},
+  )
+  assert relay.status_code == 409, relay.text
+  assert "relay supports" in relay.json()["detail"]
+  assert calls == []
+
+def test_mark_ready_rejects_live_identity_drift_without_mutation(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record = _write_personal_draft(app_id, "personal-draft-live-drift")
+  monkeypatch.setattr(
+    "app.github_contributions.shutil.which", lambda name: f"/bin/{name}",
+  )
+  calls = []
+
+  def fake_gh(_repo_path, *args, check=True):
+    calls.append(args)
+    if args[:2] == ("api", f"repos/{record['repo']}/pulls/{record['number']}"):
+      return _cp(json.dumps(_personal_pr_live(
+        record, draft=True, head_sha="c" * 40,
+      )))
+    pytest.fail("identity drift must stop before a mutation")
+
+  monkeypatch.setattr("app.github_contribution_git._gh", fake_gh)
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record['id']}/ready",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"expected_head_sha": record["last_submit_push_sha"]},
+  )
+
+  assert response.status_code == 409, response.text
+  assert response.json()["detail"]["code"] == "ready_target_changed"
+  stored = json.loads(
+    (Path(get_settings().data_dir) / "apps" / str(app_id) /
+     "contributions" / f"{record['id']}.json").read_text()
+  )
+  assert stored["status"] == "draft"
+  assert "readying" not in stored
+  assert len(calls) == 1
+
+def test_mark_ready_refuses_to_trigger_an_armed_auto_merge(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record = _write_personal_draft(app_id, "personal-draft-auto-merge")
+  monkeypatch.setattr(
+    "app.github_contributions.shutil.which", lambda name: f"/bin/{name}",
+  )
+  calls = []
+
+  def fake_gh(_repo_path, *args, check=True):
+    calls.append(args)
+    if args[:2] == ("api", f"repos/{record['repo']}/pulls/{record['number']}"):
+      return _cp(json.dumps(_personal_pr_live(
+        record,
+        draft=True,
+        auto_merge={"merge_method": "squash"},
+      )))
+    pytest.fail("an armed auto-merge must stop before the Ready mutation")
+
+  monkeypatch.setattr("app.github_contribution_git._gh", fake_gh)
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record['id']}/ready",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"expected_head_sha": record["last_submit_push_sha"]},
+  )
+
+  assert response.status_code == 409, response.text
+  assert response.json()["detail"]["code"] == "ready_auto_merge_enabled"
+  assert len(calls) == 1
+
 def _prepared_real_review(app_id, record_id):
   """Build one exact local review checkout under the route's allowlist."""
   data_dir = Path(get_settings().data_dir)
@@ -2425,7 +2722,7 @@ def _commit_metadata(
   "failure_kind",
   ["timeout", "launch-error"],
 )
-def test_submit_contribution_keeps_accepted_pr_open_on_label_transport_failure(
+def test_submit_contribution_keeps_accepted_ready_pr_on_label_transport_failure(
   client, owner_token, monkeypatch, failure_kind,
 ):
   label_failure = (
@@ -2536,12 +2833,14 @@ def test_submit_contribution_keeps_accepted_pr_open_on_label_transport_failure(
   r = client.post(
     f"/api/github/contributions/{app_id}/{record_id}/submit",
     headers={"Authorization": f"Bearer {app_token}"},
+    json={"publication_stage": "ready"},
   )
   assert r.status_code == 200, r.text
   body = r.json()
   assert body["url"] == "https://github.com/mobius-os/app-demo/pull/42"
   assert body["number"] == 42
   assert body["record"]["status"] == "open"
+  assert body["record"]["publication_stage"] == "ready"
   assert body["record"]["url"] == body["url"]
   assert body["record"]["last_submit_labels_requested"] == ["bug"]
   assert body["record"]["last_submit_labels_applied"] == []
@@ -2571,6 +2870,7 @@ def test_submit_contribution_keeps_accepted_pr_open_on_label_transport_failure(
      "contributions" / f"{record_id}.json").read_text()
   )
   assert stored["status"] == "open"
+  assert stored["publication_stage"] == "ready"
   assert stored["number"] == 42
   assert stored["head_repository"] == "octocat/app-demo-1"
   assert stored["last_submit_labels_requested"] == ["bug"]
@@ -2739,7 +3039,8 @@ def test_submit_contribution_recovers_ambiguous_create_by_exact_pushed_head(
   if existing_mode in {"match", "stale-head"}:
     assert response.status_code == 200, response.text
     assert response.json()["url"].endswith("/pull/42")
-    assert stored["status"] == "open"
+    assert stored["status"] == "draft"
+    assert stored["publication_stage"] == "draft"
     assert stored["url"].endswith("/pull/42")
     assert stored["last_submit_push_sha"] == head
     assert stored["last_submit_labels_applied"] == ["bug"]
@@ -2750,6 +3051,50 @@ def test_submit_contribution_recovers_ambiguous_create_by_exact_pushed_head(
     assert stored["last_submit_push_sha"] == head
     assert "url" not in stored
 
+
+def test_existing_pr_update_confirmation_reads_the_known_pr_directly(
+  tmp_path, monkeypatch,
+):
+  from app.github_contributions import _confirm_existing_pr_update
+
+  expected = "a" * 40
+  calls = []
+
+  def fake_gh(repo_path, *args, check=True):
+    calls.append(args)
+    head = "c" * 40 if len(calls) == 1 else expected
+    return _cp(json.dumps({
+      "html_url": "https://github.com/mobius-os/app-demo/pull/58",
+      "state": "open",
+      "head": {
+        "ref": "feat/existing-review",
+        "sha": head,
+        "repo": {"full_name": "octocat/app-demo"},
+      },
+      "base": {"ref": "main"},
+      "draft": True,
+    }))
+
+  monkeypatch.setattr("app.github_contribution_git._gh", fake_gh)
+  monkeypatch.setattr("app.github_contributions.time.sleep", lambda _seconds: None)
+
+  confirmed = _confirm_existing_pr_update(
+    tmp_path,
+    "mobius-os/app-demo",
+    58,
+    expected_head_repository="octocat/app-demo",
+    expected_head_sha=expected,
+    branch="feat/existing-review",
+    base_branch="main",
+  )
+
+  assert confirmed == (
+    "https://github.com/mobius-os/app-demo/pull/58", "draft",
+  )
+  assert calls == [
+    ("api", "repos/mobius-os/app-demo/pulls/58"),
+    ("api", "repos/mobius-os/app-demo/pulls/58"),
+  ]
 
 def test_submit_contribution_normalizes_fallback_author_before_push(
   client, owner_token, monkeypatch,
@@ -3097,8 +3442,12 @@ def test_submit_contribution_stack_opens_ordered_incremental_prs(
   )
   calls = []
 
-  def fake_submit(record, diff_path, *, direct_base_branch=None):
-    calls.append((record["id"], direct_base_branch, diff_path.name))
+  def fake_submit(
+    record, diff_path, *, direct_base_branch=None, publication_stage="draft",
+  ):
+    calls.append((
+      record["id"], direct_base_branch, diff_path.name, publication_stage,
+    ))
     number = 70 + len(calls)
     return (
       f"https://github.com/mobius-os/mobius/pull/{number}",
@@ -3106,6 +3455,7 @@ def test_submit_contribution_stack_opens_ordered_incremental_prs(
       {
         "last_submit_mode": "stack",
         "last_submit_base_branch": direct_base_branch,
+        "publication_stage": publication_stage,
       },
     )
 
@@ -3114,13 +3464,16 @@ def test_submit_contribution_stack_opens_ordered_incremental_prs(
   r = client.post(
     f"/api/github/contributions/{app_id}/submit-stack",
     headers={"Authorization": f"Bearer {app_token}"},
-    json={"record_ids": record_ids},
+    json={"record_ids": record_ids, "publication_stage": "ready"},
   )
 
   assert r.status_code == 200, r.text
   assert calls == [
-    (record_ids[0], "main", f"{record_ids[0]}.diff"),
-    (record_ids[1], f"stack/{stack_id}/01-stream", f"{record_ids[1]}.diff"),
+    (record_ids[0], "main", f"{record_ids[0]}.diff", "ready"),
+    (
+      record_ids[1], f"stack/{stack_id}/01-stream",
+      f"{record_ids[1]}.diff", "ready",
+    ),
   ]
   body = r.json()
   assert [record["status"] for record in body["records"]] == ["open", "open"]
@@ -3186,13 +3539,18 @@ def test_submit_contribution_stack_preserves_open_parent_when_child_fails(
   monkeypatch.setattr("app.routes.github._preflight_prepared_stack", lambda rows: None)
   calls = []
 
-  def fake_submit(record, diff_path, *, direct_base_branch=None):
+  def fake_submit(
+    record, diff_path, *, direct_base_branch=None, publication_stage="draft",
+  ):
     calls.append(record["id"])
     if len(calls) == 1:
       return (
         "https://github.com/mobius-os/mobius/pull/81",
         81,
-        {"last_submit_mode": "stack"},
+        {
+          "last_submit_mode": "stack",
+          "publication_stage": publication_stage,
+        },
       )
     raise ContributionSubmitError("Child PR could not be opened.")
 
@@ -3212,7 +3570,7 @@ def test_submit_contribution_stack_preserves_open_parent_when_child_fails(
     "number": 81,
   }]
   assert [record["status"] for record in detail["records"]] == [
-    "open", "prepared",
+    "draft", "prepared",
   ]
   assert detail["records"][1]["last_submit_error"] == (
     "Child PR could not be opened."
@@ -3637,7 +3995,7 @@ def test_existing_pr_update_uses_its_verified_fork_destination(
       base_branch,
       same_repo,
     ))
-    return "https://github.com/mobius-os/app-demo/pull/58"
+    return "https://github.com/mobius-os/app-demo/pull/58", "draft"
 
   monkeypatch.setattr(
     "app.github_contributions._find_existing_pr", confirm,
@@ -3665,6 +4023,7 @@ def test_existing_pr_update_uses_its_verified_fork_destination(
   assert patch["head_repository"] == "octocat/app-demo"
   assert patch["last_submit_push_sha"] == head
   assert patch["last_pushed_branch"] == f"octocat:{branch}"
+  assert patch["publication_stage"] == "draft"
 
 
 def test_existing_pr_update_stops_if_verified_fork_remote_does_not_match(
@@ -4826,7 +5185,10 @@ def test_existing_pr_update_uses_owner_approved_exact_target(
     return (
       "https://github.com/mobius-os/app-demo/pull/58",
       58,
-      {"last_submit_push_sha": record["plan"]["head_sha"]},
+      {
+        "last_submit_push_sha": record["plan"]["head_sha"],
+        "publication_stage": "draft",
+      },
     )
 
   monkeypatch.setattr(github_routes, "_submit_prepared_pr", submit)
@@ -4838,7 +5200,8 @@ def test_existing_pr_update_uses_owner_approved_exact_target(
 
   assert response.status_code == 200, response.text
   updated = response.json()["record"]
-  assert updated["status"] == "open"
+  assert updated["status"] == "draft"
+  assert updated["publication_stage"] == "draft"
   assert updated["number"] == 58
   assert updated["submitted_at"] == original["submitted_at"]
   assert updated["last_submit_push_sha"] == original["plan"]["head_sha"]
@@ -5895,7 +6258,7 @@ def test_submit_records_where_the_owner_pressed_send(
   # An unknown surface is rejected by the schema rather than stored.
   assert invalid.status_code == 422, invalid.text
 
-  def fake_submit(record, _diff_path):
+  def fake_submit(record, _diff_path, **_kwargs):
     assert record["submitter"] == "chat-review-card"
     return "https://github.com/mobius-os/app-demo/pull/17", 17, {}
 
