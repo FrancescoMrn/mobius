@@ -2285,19 +2285,16 @@ def _submit_prepared_pr(
     pushed_patch["last_submit_push_sha"] = pushed_sha
 
     if expected_existing_pr_number is not None:
-      existing = _find_existing_pr(
+      existing = _confirm_existing_pr_update(
         repo,
         upstream_repo,
-        login,
-        branch,
+        expected_existing_pr_number,
+        expected_head_repository=existing_head_repository,
         expected_head_sha=pushed_sha,
+        branch=branch,
         base_branch=submit_base,
-        same_repo=bool(direct_base),
       )
-      if (
-        not existing
-        or _parse_pr_number(existing) != expected_existing_pr_number
-      ):
+      if not existing:
         raise ContributionSubmitError(
           "The approved pull request is no longer open on this exact branch. "
           f"The reviewed branch was pushed to {pushed_branch_url}, but no new "

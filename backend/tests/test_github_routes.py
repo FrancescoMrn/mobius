@@ -3427,6 +3427,10 @@ def test_submit_contribution_stack_opens_ordered_incremental_prs(
           "base_branch": base_branch,
         },
       },
+      "quality_review": {
+        "state": "all_clear",
+        "reviewed_head_sha": head_sha,
+      },
     }
     _write_contribution(app_id, record_id, record, diff_text)
 
@@ -3532,6 +3536,10 @@ def test_submit_contribution_stack_preserves_open_parent_when_child_fails(
           "parent_record_id": parent_id,
           "base_branch": base_branch,
         },
+      },
+      "quality_review": {
+        "state": "all_clear",
+        "reviewed_head_sha": head_sha,
       },
     }
     _write_contribution(app_id, record_id, record, diff_text)
@@ -3980,25 +3988,25 @@ def test_existing_pr_update_uses_its_verified_fork_destination(
   def confirm(
     _repo,
     upstream,
-    login,
-    pushed_branch,
+    number,
     *,
+    expected_head_repository,
     expected_head_sha,
+    branch,
     base_branch,
-    same_repo,
   ):
     confirmations.append((
       upstream,
-      login,
-      pushed_branch,
+      number,
+      expected_head_repository,
+      branch,
       expected_head_sha,
       base_branch,
-      same_repo,
     ))
     return "https://github.com/mobius-os/app-demo/pull/58", "draft"
 
   monkeypatch.setattr(
-    "app.github_contributions._find_existing_pr", confirm,
+    "app.github_contributions._confirm_existing_pr_update", confirm,
   )
 
   url, number, patch = _submit_prepared_pr(
@@ -4014,11 +4022,11 @@ def test_existing_pr_update_uses_its_verified_fork_destination(
   assert pushes == [(branch, "HEAD")]
   assert confirmations == [(
     "mobius-os/app-demo",
-    "octocat",
+    58,
+    "octocat/app-demo",
     branch,
     head,
     "main",
-    False,
   )]
   assert patch["head_repository"] == "octocat/app-demo"
   assert patch["last_submit_push_sha"] == head
