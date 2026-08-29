@@ -123,6 +123,10 @@ def _safe_repo_path(raw: object) -> Path:
   # "contrib" is the staging root agents use for private review worktrees.
   allowed_roots = (
     data_dir / "contrib",
+    # Prepared records created before the staging-root rename still point at
+    # this durable checkout. Keep it reachable for the supported upgrade
+    # window; removing the path would strand reviewed owner work.
+    data_dir / "contributions",
     data_dir / "apps",
     data_dir / "platform",
   )
@@ -134,8 +138,9 @@ def _safe_repo_path(raw: object) -> Path:
       continue
   raise ContributionSubmitError(
     "This prepared PR was staged outside Mobius' durable contribution folders. "
-    "Ask the agent to prepare it again from /data/contrib, /data/apps, or "
-    "/data/platform; nothing was sent to GitHub."
+    "Ask the agent to prepare it again from /data/contrib, "
+    "/data/contributions, /data/apps, or /data/platform; nothing was sent "
+    "to GitHub."
   )
 
 

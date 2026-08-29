@@ -1797,6 +1797,9 @@ def test_safe_repo_path_accepts_durable_contribution_roots():
   assert _safe_repo_path(str(data_dir / "contrib" / "mobius-fix-x")) == (
     data_dir / "contrib" / "mobius-fix-x"
   ).resolve()
+  assert _safe_repo_path(str(data_dir / "contributions" / "legacy" / "repo")) == (
+    data_dir / "contributions" / "legacy" / "repo"
+  ).resolve()
   assert _safe_repo_path(
     str(data_dir / "contrib" / "audit-20260710-1617" / "scroll-intent-return")
   ) == (
@@ -1811,10 +1814,6 @@ def test_safe_repo_path_rejects_non_durable_locations(tmp_path):
     _safe_repo_path(str(tmp_path / "repo"))
 
   assert "durable contribution folders" in exc.value.message
-
-  with pytest.raises(ContributionSubmitError):
-    _safe_repo_path(str(Path(get_settings().data_dir) / "contributions" / "old"))
-  assert "nothing was sent to GitHub" in exc.value.message
 
   data_dir = Path(get_settings().data_dir)
 

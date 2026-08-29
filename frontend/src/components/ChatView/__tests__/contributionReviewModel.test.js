@@ -563,6 +563,11 @@ test('the swipe has a visible focusable equivalent', () => {
   assert.match(cardSrc, /import \{ X \} from '@openai\/apps-sdk-ui\/components\/Icon'/)
   assert.equal((cardSrc.match(/<X width=\{14\} height=\{14\} aria-hidden="true" \/>/g) || []).length, 4)
   assert.match(cardSrc, /className="contrib-card-stack__dismiss-all"/)
+  assert.match(
+    cardCss,
+    /\.contrib-card-stack__dismiss-all\s*\{[^}]*width:\s*44px;[^}]*height:\s*44px;/s,
+    'the stack dismiss control keeps a full coarse-pointer target',
+  )
   assert.match(cardSrc, /aria-label="Dismiss all — keeps the work in Changes and Contribute"/)
   assert.match(cardSrc, /for \(const item of pendingItems\)/)
 })
