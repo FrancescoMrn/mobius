@@ -38,6 +38,9 @@ services:
         MOBIUS_LOCAL_PLATFORM_DATE: ${MOBIUS_LOCAL_PLATFORM_DATE:-unknown}
     image: ${MOBIUS_IMAGE:-mobius}
     container_name: mobius
+    # Reap orphaned children (Docker injects docker-init as PID 1). The image
+    # also sets tini as its ENTRYPOINT so runtimes without an injected init
+    # (Railway) get the same guarantee; here that is simply redundant.
     init: true
     restart: unless-stopped
     environment:
