@@ -430,12 +430,9 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
   CMD curl -f http://localhost:8000/api/ready || exit 1
 
-# Run under tini so orphaned children (notably short-lived git helpers) are
-# always reaped. Compose sets `init: true` for this, but Railway and other
-# Dockerfile runtimes inject no init — the entrypoint's `exec su … uvicorn` then
-# becomes a non-reaping PID 1, and orphaned zombies accumulate against the
-# container PID limit until fork() fails ("Resource temporarily unavailable")
-# even with free memory. `-s` registers tini as a subreaper so it reaps (and
-# stays quiet) whether it is PID 1 (Railway) or a child of docker-init (compose).
+# Own PID 1 with tini so orphaned children (e.g. short-lived git helpers) are
+# reaped on every runtime, including hosts that inject no init of their own
+# (Railway). `-s` (subreaper) keeps reaping working whether tini is PID 1 or a
+# child of another init (Compose's docker-init).
 ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["./scripts/entrypoint.sh"]
