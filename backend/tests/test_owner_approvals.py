@@ -190,6 +190,51 @@ def test_completed_receipt_ends_only_the_exact_saved_card_turn(
     registry.unregister(chat.id, handle.kind)
 
 
+def test_streamed_receipt_survives_an_empty_completed_payload(
+  client, chat, approval_run,
+):
+  """The card cut must not depend on which channel carried the receipt.
+
+  A provider that streams command output can omit its re-aggregated copy on
+  completion (Codex's aggregatedOutput is optional). The completed event then
+  arrives empty; it must neither erase the streamed output nor skip the
+  finish-after-owner-card cut.
+  """
+  from app.runner_registry import registry
+  handle = _FakeCardHandle(chat.id)
+  registry.register(handle)
+  try:
+    approval_run[0].publish({
+      "type": "tool_start", "tool": "Bash", "input": "owner helper",
+      "tool_use_id": "owner-helper-1",
+    })
+    saved = _ask(client, chat, approval_run)
+    qid = saved.json()["question_id"]
+    async def deliver(content, *, complete=False, exit_code=None):
+      event = {
+        "type": "tool_output", "content": content,
+        "tool_use_id": "owner-helper-1",
+      }
+      if complete:
+        event["output_complete"] = True
+      if exit_code is not None:
+        event["output_exit_code"] = exit_code
+      approval_run[0].publish(event)
+      await asyncio.sleep(0)
+
+    asyncio.run(deliver(saved.text))
+    asyncio.run(deliver("", complete=True, exit_code=0))
+    assert handle.finishes == 1
+    blk = next(
+      block for block in approval_run[0].assistant_blocks
+      if block.get("type") == "tool"
+    )
+    assert blk["owner_card_question_id"] == qid
+    assert saved.text in blk["output"]
+  finally:
+    registry.unregister(chat.id, handle.kind)
+
+
 def test_native_question_event_does_not_end_the_active_turn(chat, approval_run):
   """The native AskUserQuestion path shares `publish_question` but carries no
   `response_mode`: it parks on an awaited future in question_bridge and must NOT
@@ -615,3 +660,73 @@ def test_question_tool_saves_receipt_and_never_returns_a_default_answer(monkeypa
   assert control._call_request_question({"questions": payload}) == expected
   assert captured == [payload]
   assert "answers" not in expected
+
+
+def test_prose_a_provider_races_after_a_saved_card_is_never_recorded(
+  client, chat, approval_run,
+):
+  """A committed continuation card is the turn's terminal action for EVERY
+  provider. A provider can still race prose out after it — an interrupt cannot
+  retract a message the model already produced — so the sink refuses that prose
+  outright: never accumulated, never broadcast, never persisted. That is what
+  keeps the card the visible tail without presentation having to hide anything.
+  """
+  sink = approval_run[0]
+  assert sink.publish({"type": "text", "content": "Reading the contract first."})
+  saved = _ask(client, chat, approval_run)
+  assert sink.assistant_blocks[-1]["type"] == "question"
+
+  log_before = len(sink.bc.event_log)
+  assert sink.publish({"type": "text", "content": "Card saved — waiting on you."})
+  assert sink.publish({"type": "thinking", "content": "Should I say more?"})
+  assert [b["type"] for b in sink.assistant_blocks] == ["text", "question"]
+  assert len(sink.bc.event_log) == log_before
+  persisted = _row(chat.id)[1][-1]["blocks"]
+  assert [b["type"] for b in persisted] == ["text", "question"]
+  assert persisted[-1]["question_id"] == saved.json()["question_id"]
+
+
+def test_a_streamed_messages_tail_still_lands_in_its_own_block(
+  client, chat, approval_run,
+):
+  """Prose carrying the identity of a text block streamed BEFORE the card is the
+  tail of that same provider message item (see process_event's text_item_id
+  reattachment), not new prose after a terminal action."""
+  sink = approval_run[0]
+  assert sink.publish(
+    {"type": "text", "content": "Reading it", "text_item_id": "msg-1"},
+  )
+  _ask(client, chat, approval_run)
+  assert sink.publish(
+    {"type": "text", "content": " first.", "text_item_id": "msg-1"},
+  )
+  assert [b["type"] for b in sink.assistant_blocks] == ["text", "question"]
+  assert sink.assistant_blocks[0]["content"] == "Reading it first."
+  # A different message item is new prose after the terminal card: refused.
+  assert sink.publish(
+    {"type": "text", "content": " Done.", "text_item_id": "msg-2"},
+  )
+  assert [b["type"] for b in sink.assistant_blocks] == ["text", "question"]
+
+
+def test_native_question_keeps_recording_post_card_prose(chat, approval_run):
+  """Only a continuation card is terminal. A native AskUserQuestion is
+  mid-turn, so prose after that card stays ordinary transcript."""
+  sink = approval_run[0]
+
+  async def go():
+    await sink.publish_question({
+      "type": "question",
+      "question_id": "native-post-1",
+      "questions": [{
+        "question": "Pick one",
+        "options": [
+          {"label": "A", "description": "a"},
+          {"label": "B", "description": "b"},
+        ],
+      }],
+    })
+
+  asyncio.run(go())
+  assert sink.publish({"type": "text", "content": "While you decide, notes."})
+  assert [b["type"] for b in sink.assistant_blocks] == ["question", "text"]
