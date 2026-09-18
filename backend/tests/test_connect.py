@@ -2064,6 +2064,31 @@ def test_connect_runner_never_redirects_an_authenticated_request():
   assert redirected is None
 
 
+def test_outbound_runner_env_excludes_backend_secrets(monkeypatch, tmp_path):
+  """The outbound runner serves commands from the remote instance, so its
+  environment must not carry this backend's secrets."""
+  monkeypatch.setattr(connect_outbound, "_profile_dir", lambda pid: tmp_path / pid)
+  monkeypatch.setenv("SECRET_KEY", "super-secret-signing-key")
+  monkeypatch.setenv("MOBIUS_SSO_CLIENT_SECRET", "sso-secret")
+  monkeypatch.setenv("DATABASE_URL", "postgres://user:pw@host/db")
+  monkeypatch.setenv("PATH", "/usr/bin:/bin")
+  monkeypatch.setenv("LANG", "en_US.UTF-8")
+  monkeypatch.setenv("SSL_CERT_FILE", "/etc/private-ca.pem")
+  monkeypatch.setenv("SSL_CERT_DIR", "/etc/private-ca.d")
+
+  env = connect_outbound._runner_env("o_test")
+
+  assert "SECRET_KEY" not in env
+  assert "MOBIUS_SSO_CLIENT_SECRET" not in env
+  assert "DATABASE_URL" not in env
+  assert not any(k.startswith("MOBIUS_") for k in env)
+  assert env["PATH"] == "/usr/bin:/bin"
+  assert env["LANG"] == "en_US.UTF-8"
+  assert env["SSL_CERT_FILE"] == "/etc/private-ca.pem"
+  assert env["SSL_CERT_DIR"] == "/etc/private-ca.d"
+  assert env["HOME"] == str(tmp_path / "o_test" / "home")
+  assert env["XDG_CONFIG_HOME"] == str(tmp_path / "o_test" / "home" / ".config")
+
 def test_serve_connection_retries_after_auth_rejection(monkeypatch):
   """A 401/403 must not permanently drop a connection. A transient auth failure
   (e.g. during a deploy) should be retried with backoff, not silently
