@@ -318,6 +318,22 @@ def test_restart_guidance_requires_activation_proof_and_fresh_approval():
   )
 
 
+def test_saved_secure_input_is_a_terminal_agent_action():
+  repo = Path(__file__).resolve().parents[2]
+  guidance = (
+    repo / "backend" / "scripts" / "seed-skills" / "secure-input.md"
+  ).read_text(encoding="utf-8")
+  normalized = " ".join(guidance.split())
+
+  assert (
+    "The card is the final action of the turn, exactly like Möbius's saved "
+    "Q&A and approval cards."
+  ) in normalized
+  assert (
+    "On a confirmed receipt, end the turn with **no further text or tools**."
+  ) in normalized
+
+
 def test_owned_app_skill_summaries_expose_complete_initial_read_sets():
   repo = Path(__file__).resolve().parents[2]
   seed_dir = repo / "backend" / "scripts" / "seed-skills"

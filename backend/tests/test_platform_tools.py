@@ -576,3 +576,16 @@ def test_saved_card_option_schema_exposes_explicit_quiet_outcome():
   ):
     assert option["properties"]["on_answer"]["enum"] == ["resume", "close"]
     assert "on_answer" not in option["required"]
+
+
+def test_saved_card_tools_instruct_the_agent_to_end_at_the_card():
+  """Every exposed saved-card tool carries the same complete instruction."""
+  control = _control_module()
+  instruction = control.SAVED_CARD_TERMINAL_INSTRUCTION.lower()
+  for name in (
+    control.REQUEST_APPROVAL_TOOL,
+    control.REQUEST_QUESTION_TOOL,
+    control.REQUEST_RESTART_TOOL,
+  ):
+    description = control._TOOL_DEFINITIONS[name]["description"].lower()
+    assert description.count(instruction) == 1
