@@ -72,6 +72,7 @@ def _pause_note(
   *,
   kind: str | None = None,
   resets_at: str | None = None,
+  provider: str | None = None,
   resumable: bool = True,
 ) -> dict:
   """Build the ONE error-block/event shape every pause producer emits.
@@ -97,6 +98,8 @@ def _pause_note(
     pause: dict = {"kind": kind}
     if resets_at is not None:
       pause["resets_at"] = resets_at
+    if provider is not None:
+      pause["provider"] = provider
     note["pause"] = pause
   return note
 
